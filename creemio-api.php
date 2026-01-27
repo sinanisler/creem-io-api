@@ -448,15 +448,20 @@ class Creem_API_WordPress {
      */
     private function parse_creem_products($json_data) {
         $products = array();
-        if (!isset($json_data['items'])) {
+        if (!isset($json_data['items']) || !is_array($json_data['items'])) {
             return $products;
         }
 
         foreach ($json_data['items'] as $item) {
+            // According to Creem.io API docs, status can be: "active", "archived", etc.
+            $status = isset($item['status']) ? $item['status'] : 'unknown';
+            $published = ($status === 'active');
+
             $products[] = array(
-                'id' => isset($item['id']) ? $item['id'] : '',
-                'name' => isset($item['name']) ? $item['name'] : '',
-                'published' => isset($item['status']) && $item['status'] === 'active'
+                'id' => isset($item['id']) ? strval($item['id']) : '',
+                'name' => isset($item['name']) ? $item['name'] : 'Unnamed Product',
+                'published' => $published,
+                'status' => $status // Keep original status for debugging
             );
         }
         return $products;
@@ -466,18 +471,41 @@ class Creem_API_WordPress {
      * Get error message from Creem.io JSON response
      */
     private function get_api_error_message($json_data) {
+        // Check if $json_data is null or not an array
+        if (!is_array($json_data)) {
+            return 'Invalid API response format';
+        }
+
+        // Check for 'error' field (can be string or object)
         if (isset($json_data['error'])) {
             if (is_string($json_data['error'])) {
                 return $json_data['error'];
             }
-            if (is_array($json_data['error']) && isset($json_data['error']['message'])) {
-                return $json_data['error']['message'];
+            if (is_array($json_data['error'])) {
+                if (isset($json_data['error']['message'])) {
+                    return $json_data['error']['message'];
+                }
+                // Return the whole error array as JSON string
+                return json_encode($json_data['error']);
             }
         }
+
+        // Check for 'message' field
         if (isset($json_data['message'])) {
             return $json_data['message'];
         }
-        return 'Unknown API error';
+
+        // Check for 'detail' field (some APIs use this)
+        if (isset($json_data['detail'])) {
+            return $json_data['detail'];
+        }
+
+        // If we have the whole response, try to extract useful info
+        if (isset($json_data['status']) && isset($json_data['title'])) {
+            return $json_data['title'] . ' (Status: ' . $json_data['status'] . ')';
+        }
+
+        return 'Unknown API error - check logs for details';
     }
 
     /**
@@ -497,17 +525,21 @@ class Creem_API_WordPress {
         // Determine which API URL to use based on mode
         $test_mode = isset($settings['test_mode']) && $settings['test_mode'];
         $base_url = $test_mode ? 'https://test-api.creem.io' : 'https://api.creem.io';
-        
-        // Fetch recent transactions from Creem.io API
-        $orders_url = "{$base_url}/v1/transactions";
+
+        // Fetch recent transactions from Creem.io API using the correct endpoint
+        // Use /v1/transactions/search with pagination parameters
+        $page_size = min($sales_limit, 100); // API max per page is usually 100
+        $orders_url = "{$base_url}/v1/transactions/search?page_size={$page_size}&page_number=1";
 
         $this->log_activity('FETCHING ORDERS', array(
             'url' => $orders_url,
-            'sales_limit' => $sales_limit
+            'sales_limit' => $sales_limit,
+            'test_mode' => $test_mode
         ));
 
         $response = wp_remote_get($orders_url, array(
-            'headers' => $this->get_api_headers($access_token)
+            'headers' => $this->get_api_headers($access_token),
+            'timeout' => 30
         ));
 
         if (is_wp_error($response)) {
@@ -518,22 +550,48 @@ class Creem_API_WordPress {
             return;
         }
 
+        $http_code = wp_remote_retrieve_response_code($response);
         $body = wp_remote_retrieve_body($response);
         $data = json_decode($body, true);
 
         // Log raw transactions response for debugging
         $this->log_activity('RAW TRANSACTIONS RESPONSE', array(
             'url' => $orders_url,
+            'http_code' => $http_code,
             'total_transactions' => isset($data['items']) ? count($data['items']) : 0,
             'raw_response' => $data
         ));
 
-        // Check for Creem.io response structure
-        if (!isset($data['items'])) {
+        // Check for API errors
+        if ($http_code === 401) {
+            $this->log_activity('Transactions API error', array(
+                'error' => 'Authentication failed: Missing API key',
+                'http_code' => $http_code
+            ));
+            return;
+        } elseif ($http_code === 403) {
+            $this->log_activity('Transactions API error', array(
+                'error' => 'Authentication failed: Invalid API key',
+                'http_code' => $http_code
+            ));
+            return;
+        } elseif ($http_code >= 400) {
             $error_msg = $this->get_api_error_message($data);
             $this->log_activity('Transactions API error', array(
                 'url' => $orders_url,
+                'http_code' => $http_code,
                 'error' => $error_msg,
+                'response' => $data
+            ));
+            return;
+        }
+
+        // Check for Creem.io response structure
+        if (!isset($data['items']) || !is_array($data['items'])) {
+            $error_msg = $this->get_api_error_message($data);
+            $this->log_activity('Transactions API error', array(
+                'url' => $orders_url,
+                'error' => 'Invalid response structure: ' . $error_msg,
                 'response' => $data
             ));
             return;
@@ -1894,15 +1952,17 @@ class Creem_API_WordPress {
         
         function testApiConnection() {
             var token = document.getElementById('access_token').value;
+            var testMode = document.querySelector('input[name="test_mode"]').checked;
             var resultDiv = document.getElementById('api-test-result');
-            
+
             if (!token) {
                 resultDiv.innerHTML = '<p style="color: red;">⚠️ Please enter an access token first.</p>';
                 return;
             }
-            
-            resultDiv.innerHTML = '<p><span class="spinner is-active"></span> Testing connection and fetching products...</p>';
-            
+
+            var modeText = testMode ? ' (Test Mode)' : ' (Production Mode)';
+            resultDiv.innerHTML = '<p><span class="spinner is-active"></span> Testing connection and fetching products' + modeText + '...</p>';
+
             // First test the API
             jQuery.ajax({
                 url: ajaxurl,
@@ -1910,33 +1970,35 @@ class Creem_API_WordPress {
                 data: {
                     action: 'creem_test_api',
                     token: token,
+                    test_mode: testMode,
                     nonce: '<?php echo wp_create_nonce('creem_test_api'); ?>'
                 },
                 success: function(response) {
                     if (response.success) {
                         resultDiv.innerHTML = '<p style="color: green;">✓ ' + response.data.message + '</p>';
                         // Now fetch products
-                        fetchProducts(token);
+                        fetchProducts(token, testMode);
                     } else {
                         resultDiv.innerHTML = '<p style="color: red;">✗ ' + response.data.message + '</p>';
                     }
                 },
-                error: function() {
-                    resultDiv.innerHTML = '<p style="color: red;">✗ Connection test failed.</p>';
+                error: function(xhr, status, error) {
+                    resultDiv.innerHTML = '<p style="color: red;">✗ Connection test failed: ' + error + '</p>';
                 }
             });
         }
         
-        function fetchProducts(token) {
+        function fetchProducts(token, testMode) {
             jQuery('#products-loading').show();
             jQuery('#products-notice').hide();
-            
+
             jQuery.ajax({
                 url: ajaxurl,
                 type: 'POST',
                 data: {
                     action: 'creem_fetch_products',
                     token: token,
+                    test_mode: testMode,
                     nonce: '<?php echo wp_create_nonce('creem_fetch_products'); ?>'
                 },
                 success: function(response) {
@@ -1949,9 +2011,10 @@ class Creem_API_WordPress {
                         alert('Failed to fetch products: ' + response.data.message);
                     }
                 },
-                error: function() {
+                error: function(xhr, status, error) {
                     jQuery('#products-loading').hide();
-                    alert('Failed to fetch products. Please try again.');
+                    alert('Failed to fetch products: ' + error + '. Please check the browser console for more details.');
+                    console.error('Products fetch error:', xhr.responseText);
                 }
             });
         }
@@ -2154,24 +2217,48 @@ class Creem_API_WordPress {
             wp_send_json_error(array('message' => 'API key is required'));
         }
 
-        $response = wp_remote_get('https://api.creem.io/v1/user', array(
-            'headers' => $this->get_api_headers($token)
+        // Determine which API URL to use based on test mode checkbox
+        $test_mode = isset($_POST['test_mode']) && $_POST['test_mode'] === 'true';
+        $base_url = $test_mode ? 'https://test-api.creem.io' : 'https://api.creem.io';
+
+        // Test connection by fetching products (simpler than customers which need params)
+        $response = wp_remote_get($base_url . '/v1/products/search?page_size=1', array(
+            'headers' => $this->get_api_headers($token),
+            'timeout' => 15
         ));
 
         if (is_wp_error($response)) {
             wp_send_json_error(array('message' => 'Connection failed: ' . $response->get_error_message()));
         }
 
+        $http_code = wp_remote_retrieve_response_code($response);
         $body = wp_remote_retrieve_body($response);
         $data = json_decode($body, true);
 
-        // Parse JSON:API response
-        $user = $this->parse_creem_user($data);
-        if ($user && !empty($user['name'])) {
-            wp_send_json_success(array('message' => 'Connected successfully! User: ' . $user['name']));
-        } else {
+        // Log the test for debugging
+        $this->log_activity('API Connection Test', array(
+            'http_code' => $http_code,
+            'test_mode' => $test_mode,
+            'base_url' => $base_url,
+            'response' => $data
+        ));
+
+        // Check for authentication errors
+        if ($http_code === 401) {
+            wp_send_json_error(array('message' => 'Authentication failed: Missing API key'));
+        } elseif ($http_code === 403) {
+            wp_send_json_error(array('message' => 'Authentication failed: Invalid API key'));
+        } elseif ($http_code >= 400) {
             $error_message = $this->get_api_error_message($data);
-            wp_send_json_error(array('message' => 'API Error: ' . $error_message));
+            wp_send_json_error(array('message' => 'API Error (' . $http_code . '): ' . $error_message));
+        }
+
+        // Success - API connection works
+        if ($http_code === 200 && isset($data['items'])) {
+            $mode = $test_mode ? 'Test Mode' : 'Production Mode';
+            wp_send_json_success(array('message' => 'Connected successfully! (' . $mode . ')'));
+        } else {
+            wp_send_json_error(array('message' => 'Unexpected response format from API'));
         }
     }
     
@@ -2191,24 +2278,66 @@ class Creem_API_WordPress {
             wp_send_json_error(array('message' => 'API key is required'));
         }
 
-        $response = wp_remote_get('https://api.creem.io/v1/products/search', array(
-            'headers' => $this->get_api_headers($token)
+        // Determine which API URL to use based on test mode checkbox
+        $test_mode = isset($_POST['test_mode']) && $_POST['test_mode'] === 'true';
+        $base_url = $test_mode ? 'https://test-api.creem.io' : 'https://api.creem.io';
+
+        // Fetch all products with pagination
+        $all_products = array();
+        $page_number = 1;
+        $page_size = 50; // Fetch 50 products per page
+
+        do {
+            $url = $base_url . '/v1/products/search?page_number=' . $page_number . '&page_size=' . $page_size;
+
+            $response = wp_remote_get($url, array(
+                'headers' => $this->get_api_headers($token),
+                'timeout' => 15
+            ));
+
+            if (is_wp_error($response)) {
+                wp_send_json_error(array('message' => 'Failed to fetch products: ' . $response->get_error_message()));
+            }
+
+            $http_code = wp_remote_retrieve_response_code($response);
+            $body = wp_remote_retrieve_body($response);
+            $data = json_decode($body, true);
+
+            // Check for errors
+            if ($http_code === 401) {
+                wp_send_json_error(array('message' => 'Authentication failed: Missing API key'));
+            } elseif ($http_code === 403) {
+                wp_send_json_error(array('message' => 'Authentication failed: Invalid API key'));
+            } elseif ($http_code >= 400) {
+                $error_message = $this->get_api_error_message($data);
+                wp_send_json_error(array('message' => 'API Error (' . $http_code . '): ' . $error_message));
+            }
+
+            // Parse products response
+            $products = $this->parse_creem_products($data);
+            if (!empty($products)) {
+                $all_products = array_merge($all_products, $products);
+            }
+
+            // Check if there are more pages
+            $has_more_pages = false;
+            if (isset($data['pagination']) && isset($data['pagination']['next_page_number'])) {
+                $has_more_pages = !is_null($data['pagination']['next_page_number']);
+                $page_number = $data['pagination']['next_page_number'];
+            }
+
+        } while ($has_more_pages);
+
+        // Log the fetch for debugging
+        $this->log_activity('Products Fetched', array(
+            'total_products' => count($all_products),
+            'test_mode' => $test_mode
         ));
 
-        if (is_wp_error($response)) {
-            wp_send_json_error(array('message' => 'Failed to fetch products: ' . $response->get_error_message()));
-        }
-
-        $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body, true);
-
-        // Parse JSON:API response
-        $products = $this->parse_creem_products($data);
-        if (!empty($products)) {
-            wp_send_json_success(array('products' => $products));
+        if (!empty($all_products)) {
+            wp_send_json_success(array('products' => $all_products));
         } else {
-            $error_message = $this->get_api_error_message($data);
-            wp_send_json_error(array('message' => 'API Error: ' . $error_message));
+            wp_send_json_error(array('message' => 'No products found. Please create products in your Creem.io dashboard first.'));
         }
     }
 
