@@ -2,7 +2,7 @@
 /** 
  * Plugin Name: Creem.io API to WordPress Sync
  * Plugin URI: https://github.com/sinanisler/creem-io-api
- * Description: Creem.io API to WordPress Sync - Automatically create WordPress users from Creem.io sales
+ * Description: Automatically create WordPress users from Creem.io sales
  * Version: 1.0.0
  * Author: sinanisler
  * Author URI: https://github.com/sinanisler
