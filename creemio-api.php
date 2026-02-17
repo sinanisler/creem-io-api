@@ -50,6 +50,9 @@ class Creem_API_WordPress {
 
         // Subscription renewal redirect
         add_action('template_redirect', array($this, 'check_subscription_renewal_redirect'));
+
+        // Shortcode: [creem_billing_link]
+        add_shortcode('creem_billing_link', array($this, 'creem_billing_link_shortcode'));
     }
     
     /**
@@ -1003,7 +1006,20 @@ class Creem_API_WordPress {
             update_user_meta($user_id, 'creem_created_date', current_time('mysql'));
             update_user_meta($user_id, 'creem_sale_data', json_encode($sale_data));
             update_user_meta($user_id, 'creem_assigned_roles', json_encode($roles));
-            
+
+            // Store customer ID for billing portal access
+            $creem_customer_id = '';
+            if (isset($sale_data['customer'])) {
+                if (is_string($sale_data['customer']) && !empty($sale_data['customer'])) {
+                    $creem_customer_id = $sale_data['customer'];
+                } elseif (is_array($sale_data['customer']) && !empty($sale_data['customer']['id'])) {
+                    $creem_customer_id = $sale_data['customer']['id'];
+                }
+            }
+            if (!empty($creem_customer_id)) {
+                update_user_meta($user_id, 'creem_customer_id', $creem_customer_id);
+            }
+
             // Send welcome email
             $email_sent = false;
             if (isset($settings['send_welcome_email']) && $settings['send_welcome_email']) {
@@ -3058,7 +3074,8 @@ class Creem_API_WordPress {
             'creem_refunded',
             'creem_refunded_date',
             'creem_subscription_status',
-            'creem_subscription_ended_date'
+            'creem_subscription_ended_date',
+            'creem_customer_id'
         );
         
         $total_meta_deleted = 0;
@@ -3170,6 +3187,118 @@ class Creem_API_WordPress {
                 }
             }
         }
+    }
+
+    /**
+     * Generate a Creem.io customer billing portal link via the API.
+     *
+     * @param string $customer_id The Creem.io customer ID.
+     * @return string|WP_Error Portal URL on success, WP_Error on failure.
+     */
+    private function generate_customer_portal_link($customer_id) {
+        $settings = get_option($this->option_name);
+        $access_token = isset($settings['access_token']) ? $settings['access_token'] : '';
+
+        if (empty($access_token) || empty($customer_id)) {
+            return new WP_Error('invalid_params', 'API key and customer ID are required');
+        }
+
+        $test_mode = isset($settings['test_mode']) && $settings['test_mode'];
+        $base_url = $test_mode ? 'https://test-api.creem.io' : 'https://api.creem.io';
+
+        $response = wp_remote_post($base_url . '/v1/customers/billing', array(
+            'headers' => $this->get_api_headers($access_token),
+            'body'    => json_encode(array('customer_id' => $customer_id)),
+            'timeout' => 15
+        ));
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        $http_code = wp_remote_retrieve_response_code($response);
+        $body      = wp_remote_retrieve_body($response);
+        $data      = json_decode($body, true);
+
+        if ($http_code !== 200 || !isset($data['customer_portal_link'])) {
+            $error_msg = $this->get_api_error_message($data);
+            return new WP_Error('api_error', $error_msg);
+        }
+
+        return $data['customer_portal_link'];
+    }
+
+    /**
+     * Shortcode: [creem_billing_link]
+     *
+     * Renders a customer billing portal link for the currently logged-in user.
+     *
+     * Attributes:
+     *   text                 - Anchor text (default: "Manage Subscription")
+     *   class                - CSS class(es) to add to the <a> tag
+     *   not_logged_in_text   - Text shown when user is not logged in (empty = show nothing)
+     *   no_subscription_text - Text shown when user has no Creem customer record (empty = show nothing)
+     *
+     * Usage examples:
+     *   [creem_billing_link]
+     *   [creem_billing_link text="Manage Billing" class="button"]
+     *   [creem_billing_link not_logged_in_text="Please log in to manage your subscription."]
+     */
+    public function creem_billing_link_shortcode($atts) {
+        $atts = shortcode_atts(array(
+            'text'                 => __('Manage Subscription', 'snn'),
+            'class'                => '',
+            'not_logged_in_text'   => '',
+            'no_subscription_text' => '',
+        ), $atts, 'creem_billing_link');
+
+        if (!is_user_logged_in()) {
+            return !empty($atts['not_logged_in_text'])
+                ? '<span>' . esc_html($atts['not_logged_in_text']) . '</span>'
+                : '';
+        }
+
+        $current_user = wp_get_current_user();
+
+        // Retrieve stored customer ID.
+        $customer_id = get_user_meta($current_user->ID, 'creem_customer_id', true);
+
+        // If not cached, try to extract it from the raw sale data.
+        if (empty($customer_id)) {
+            $sale_data_json = get_user_meta($current_user->ID, 'creem_sale_data', true);
+            if (!empty($sale_data_json)) {
+                $sale_data = json_decode($sale_data_json, true);
+                if (is_array($sale_data) && isset($sale_data['customer'])) {
+                    if (is_string($sale_data['customer']) && !empty($sale_data['customer'])) {
+                        $customer_id = $sale_data['customer'];
+                    } elseif (is_array($sale_data['customer']) && !empty($sale_data['customer']['id'])) {
+                        $customer_id = $sale_data['customer']['id'];
+                    }
+                }
+                // Cache for future shortcode renders.
+                if (!empty($customer_id)) {
+                    update_user_meta($current_user->ID, 'creem_customer_id', $customer_id);
+                }
+            }
+        }
+
+        if (empty($customer_id)) {
+            return !empty($atts['no_subscription_text'])
+                ? '<span>' . esc_html($atts['no_subscription_text']) . '</span>'
+                : '';
+        }
+
+        $portal_link = $this->generate_customer_portal_link($customer_id);
+
+        if (is_wp_error($portal_link)) {
+            return '';
+        }
+
+        $class_attr = !empty($atts['class']) ? ' class="' . esc_attr($atts['class']) . '"' : '';
+
+        return '<a href="' . esc_url($portal_link) . '"' . $class_attr . ' target="_blank" rel="noopener noreferrer">'
+            . esc_html($atts['text'])
+            . '</a>';
     }
 }
 
