@@ -1819,7 +1819,7 @@ class Creem_API_WordPress {
                         <tr>
                             <th scope="row"><label for="cron_interval"><?php _e('Check Interval (seconds)', 'snn'); ?></label></th>
                             <td>
-                                <input type="number" name="cron_interval" id="cron_interval" value="<?php echo esc_attr($settings['cron_interval']); ?>" class="small-text" min="60" />
+                                <input type="number" name="cron_interval" id="cron_interval" value="<?php echo esc_attr($settings['cron_interval']); ?>" class="small-text" min="30" />
                                 <p class="description"><?php _e('How often to check for new sales (default: 120 seconds)', 'snn'); ?></p>
                             </td>
                         </tr>
