@@ -684,6 +684,13 @@ class Creem_API_WordPress {
                     $email = isset($subscription['customer']['email']) ? sanitize_email($subscription['customer']['email']) : $email;
                 }
 
+                // If transaction doesn't have product but subscription does, inject product data from subscription
+                if (!isset($sale['product']) 
+                    && isset($subscription) && is_array($subscription) && !is_wp_error($subscription)
+                    && isset($subscription['product']) && is_array($subscription['product'])) {
+                    $sale['product'] = $subscription['product'];
+                }
+
                 // Reliable check: does a WP user with this email already have this exact sale_id recorded?
                 $should_process = true;
                 if (!empty($email) && !empty($sale_id)) {
