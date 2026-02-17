@@ -12,8 +12,8 @@ Automatically create WordPress users from Creem.io sales with API.
 
 1. Download the plugin ZIP from GitHub and upload via **Plugins → Add New → Upload**
 2. Activate the plugin
-3. Go to **Creem.io API → Settings** and create your Product on **Creem.io** as well
-4. Paste your API key (from Creem.io dashboard → Settings → API Keys)
+3. Go to **Creem.io API → Settings** 
+4. Paste your API key (that you copied from Creem.io dashboard → Settings → API Keys)
 5. Click **Test & Fetch Products** to load your products
 6. Enable **Auto Create Users** for each product you want to trigger account creation
 7. Save Settings — the cron job starts automatically
