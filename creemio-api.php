@@ -529,95 +529,87 @@ class Creem_API_WordPress {
         $test_mode = isset($settings['test_mode']) && $settings['test_mode'];
         $base_url = $test_mode ? 'https://test-api.creem.io' : 'https://api.creem.io';
 
-        // Fetch recent transactions from Creem.io API using the correct endpoint
-        // Use /v1/transactions/search with pagination parameters
-        $page_size = min($sales_limit, 100); // API max per page is usually 100
-        $orders_url = "{$base_url}/v1/transactions/search?page_size={$page_size}&page_number=1";
+        // Fetch ALL transactions via pagination so no sales are ever missed
+        $page_size = 100; // Max per page
+        $page_number = 1;
+        $transactions = array();
 
-        $this->log_activity('FETCHING ORDERS', array(
-            'url' => $orders_url,
-            'sales_limit' => $sales_limit,
-            'test_mode' => $test_mode
-        ));
+        do {
+            $orders_url = "{$base_url}/v1/transactions/search?page_size={$page_size}&page_number={$page_number}";
 
-        $response = wp_remote_get($orders_url, array(
-            'headers' => $this->get_api_headers($access_token),
-            'timeout' => 30
-        ));
-
-        if (is_wp_error($response)) {
-            $this->log_activity('Orders fetch error', array(
+            $this->log_activity('FETCHING ORDERS', array(
                 'url' => $orders_url,
-                'error' => $response->get_error_message()
+                'page' => $page_number,
+                'sales_limit' => $sales_limit,
+                'test_mode' => $test_mode
             ));
-            return;
-        }
 
-        $http_code = wp_remote_retrieve_response_code($response);
-        $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body, true);
-
-        // Log raw transactions response for debugging
-        $this->log_activity('RAW TRANSACTIONS RESPONSE', array(
-            'url' => $orders_url,
-            'http_code' => $http_code,
-            'total_transactions' => isset($data['items']) ? count($data['items']) : 0,
-            'raw_response' => $data
-        ));
-
-        // Check for API errors
-        if ($http_code === 401) {
-            $this->log_activity('Transactions API error', array(
-                'error' => 'Authentication failed: Missing API key',
-                'http_code' => $http_code
+            $response = wp_remote_get($orders_url, array(
+                'headers' => $this->get_api_headers($access_token),
+                'timeout' => 30
             ));
-            return;
-        } elseif ($http_code === 403) {
-            $this->log_activity('Transactions API error', array(
-                'error' => 'Authentication failed: Invalid API key',
-                'http_code' => $http_code
-            ));
-            return;
-        } elseif ($http_code >= 400) {
-            $error_msg = $this->get_api_error_message($data);
-            $this->log_activity('Transactions API error', array(
+
+            if (is_wp_error($response)) {
+                $this->log_activity('Orders fetch error', array(
+                    'url' => $orders_url,
+                    'error' => $response->get_error_message()
+                ));
+                return;
+            }
+
+            $http_code = wp_remote_retrieve_response_code($response);
+            $body = wp_remote_retrieve_body($response);
+            $data = json_decode($body, true);
+
+            $this->log_activity('RAW TRANSACTIONS RESPONSE', array(
                 'url' => $orders_url,
                 'http_code' => $http_code,
-                'error' => $error_msg,
-                'response' => $data
+                'page' => $page_number,
+                'items_on_page' => isset($data['items']) ? count($data['items']) : 0,
+                'raw_response' => $data
             ));
-            return;
-        }
 
-        // Check for Creem.io response structure
-        if (!isset($data['items']) || !is_array($data['items'])) {
-            $error_msg = $this->get_api_error_message($data);
-            $this->log_activity('Transactions API error', array(
-                'url' => $orders_url,
-                'error' => 'Invalid response structure: ' . $error_msg,
-                'response' => $data
-            ));
-            return;
-        }
+            if ($http_code === 401) {
+                $this->log_activity('Transactions API error', array('error' => 'Authentication failed: Missing API key', 'http_code' => $http_code));
+                return;
+            } elseif ($http_code === 403) {
+                $this->log_activity('Transactions API error', array('error' => 'Authentication failed: Invalid API key', 'http_code' => $http_code));
+                return;
+            } elseif ($http_code >= 400) {
+                $error_msg = $this->get_api_error_message($data);
+                $this->log_activity('Transactions API error', array('url' => $orders_url, 'http_code' => $http_code, 'error' => $error_msg));
+                return;
+            }
 
-        // Parse transactions
-        $transactions = $this->parse_creem_transactions($data);
+            if (!isset($data['items']) || !is_array($data['items'])) {
+                $this->log_activity('Transactions API error', array('error' => 'Invalid response structure', 'response' => $data));
+                return;
+            }
 
-        // Log first transaction completely raw
+            $page_transactions = $this->parse_creem_transactions($data);
+            $transactions = array_merge($transactions, $page_transactions);
+
+            // Stop if we have enough or there are no more pages
+            $has_next_page = !empty($data['pagination']['next_page']);
+            $page_number++;
+
+        } while ($has_next_page && count($transactions) < $sales_limit);
+
+        // Log first transaction for debugging
         if (!empty($transactions)) {
             $this->log_activity('RAW TRANSACTION FROM API', array(
                 'raw_transaction' => $transactions[0],
+                'total_fetched' => count($transactions),
                 'IMPORTANT' => 'This is the COMPLETE unmodified transaction data from Creem.io'
             ));
         }
 
         if (!empty($transactions)) {
-            $processed_sales = get_option('creem_processed_sales', array());
             $new_sales_count = 0;
             $refunds_processed = 0;
             $subscriptions_updated = 0;
 
-            foreach (array_slice($transactions, 0, $sales_limit) as $sale) {
+            foreach ($transactions as $sale) {
                 $sale_id = isset($sale['id']) ? $sale['id'] : '';
 
                 // Creem.io uses simple JSON structure, no attributes wrapper
@@ -692,59 +684,28 @@ class Creem_API_WordPress {
                     $email = isset($subscription['customer']['email']) ? sanitize_email($subscription['customer']['email']) : $email;
                 }
 
-                // Check if sale was processed AND user still exists
+                // Reliable check: does a WP user with this email already have this exact sale_id recorded?
                 $should_process = true;
-                if (in_array($sale_id, $processed_sales)) {
-                    // Sale was processed before, but check if user still exists
-                    if (!empty($email)) {
-                        $user = get_user_by('email', $email);
-                        if ($user) {
-                            $stored_sale_id = get_user_meta($user->ID, 'creem_sale_id', true);
-                            if ($stored_sale_id === $sale_id) {
-                                // User exists and matches this sale, skip processing
-                                $should_process = false;
-                            } else {
-                                // User exists but doesn't match this sale ID - they may have multiple purchases
-                                $processed_sales = array_diff($processed_sales, array($sale_id));
-                                $this->log_activity('Sale re-processed', array(
-                                    'reason' => 'User exists but sale_id mismatch (may have multiple purchases)',
-                                    'sale_id' => $sale_id,
-                                    'stored_sale_id' => $stored_sale_id,
-                                    'email' => $email,
-                                    'user_id' => $user->ID
-                                ));
-                            }
-                        } else {
-                            // User was actually deleted
-                            $processed_sales = array_diff($processed_sales, array($sale_id));
-                            $this->log_activity('Sale re-processed', array(
-                                'reason' => 'User was deleted from WordPress',
-                                'sale_id' => $sale_id,
-                                'email' => $email
-                            ));
+                if (!empty($email) && !empty($sale_id)) {
+                    $existing_user = get_user_by('email', $email);
+                    if ($existing_user) {
+                        $stored_sale_id = get_user_meta($existing_user->ID, 'creem_sale_id', true);
+                        if ($stored_sale_id === $sale_id) {
+                            $should_process = false; // Already processed, user exists
                         }
                     }
                 }
 
                 if ($should_process) {
                     $result = $this->process_sale($sale);
-
                     if (!is_wp_error($result)) {
-                        $processed_sales[] = $sale_id;
                         $new_sales_count++;
                     }
                 }
             }
 
-            // Keep only last 1000 processed sale IDs to prevent array from growing too large
-            if (count($processed_sales) > 1000) {
-                $processed_sales = array_slice($processed_sales, -1000);
-            }
-
-            update_option('creem_processed_sales', $processed_sales);
-
             $this->log_activity('Cron completed', array(
-                'total_sales_checked' => count($orders),
+                'total_sales_checked' => count($transactions),
                 'new_sales_processed' => $new_sales_count,
                 'refunds_processed' => $refunds_processed,
                 'subscriptions_updated' => $subscriptions_updated
