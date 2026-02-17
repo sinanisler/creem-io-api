@@ -8,6 +8,20 @@
 Automatically create WordPress users from Creem.io sales with API.
 
 
+## Features
+
+- Automatic user creation from purchases
+- Product-specific role assignment
+- Per-product auto-create toggle
+- Refund handling
+- Subscription management
+- Welcome emails
+- Activity logging
+- User management UI
+- Dashboard statistics
+
+
+
 ## Installation
 
 1. Download the [latest release plugin ZIP](https://github.com/sinanisler/creem-io-api/releases) from GitHub and upload via **Plugins → Add New → Upload**
@@ -22,19 +36,6 @@ Automatically create WordPress users from Creem.io sales with API.
 Optional attributes: `text`, `class`, `not_logged_in_text`, `no_subscription_text`
 Example: `[creem_billing_link text="Manage Billing" class="button"]`
 Example: `[creem_billing_link not_logged_in_text="Please log in to manage your subscription."]`
-
-
-## Features
-
-- Automatic user creation from purchases
-- Product-specific role assignment
-- Per-product auto-create toggle
-- Refund handling
-- Subscription management
-- Welcome emails
-- Activity logging
-- User management UI
-- Dashboard statistics
 
 
 <img width="1903" height="976" alt="image" src="https://github.com/user-attachments/assets/ae03fa9c-aafe-427b-b3fb-6ae898111fc0" />
