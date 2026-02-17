@@ -684,6 +684,14 @@ class Creem_API_WordPress {
                     }
                 }
 
+                // If transaction customer is a string ID, inject full customer from subscription
+                if (isset($sale['customer']) && is_string($sale['customer'])
+                    && isset($subscription) && is_array($subscription) && !is_wp_error($subscription)
+                    && isset($subscription['customer']) && is_array($subscription['customer'])) {
+                    $sale['customer'] = $subscription['customer'];
+                    $email = isset($subscription['customer']['email']) ? sanitize_email($subscription['customer']['email']) : $email;
+                }
+
                 // Check if sale was processed AND user still exists
                 $should_process = true;
                 if (in_array($sale_id, $processed_sales)) {
