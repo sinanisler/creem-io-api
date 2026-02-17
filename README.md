@@ -8,6 +8,22 @@
 Automatically create WordPress users from Creem.io sales with API.
 
 
+## Installation
+
+1. Download the plugin ZIP from GitHub and upload via **Plugins → Add New → Upload**
+2. Activate the plugin
+3. Go to **Creem.io API → Settings** and create your Product on **Creem.io** as well
+4. Paste your API key (from Creem.io dashboard → Settings → API Keys)
+5. Click **Test & Fetch Products** to load your products
+6. Enable **Auto Create Users** for each product you want to trigger account creation
+7. Save Settings — the cron job starts automatically
+
+**Shortcode:** Use `[creem_billing_link]` anywhere to show a billing portal link for logged-in users.
+Optional attributes: `text`, `class`, `not_logged_in_text`, `no_subscription_text`
+Example: `[creem_billing_link text="Manage Billing" class="button"]`
+Example: `[creem_billing_link not_logged_in_text="Please log in to manage your subscription."]`
+
+
 ## Features
 
 - Automatic user creation from purchases
