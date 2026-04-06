@@ -15,7 +15,7 @@ if (!defined('ABSPATH')) {
 $github_repo_owner = 'sinanisler';
 $github_repo_name  = 'creem-io-api';
 $plugin_slug       = 'creem-io-api';
-$plugin_file       = 'creem-io-api/creem-io-api.php';
+$plugin_file       = 'creem-io-api/creemio-api.php';
 
 /**
  * Check for Plugin Updates from GitHub
