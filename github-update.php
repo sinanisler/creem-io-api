@@ -1,7 +1,7 @@
 <?php
 /**
- * GitHub Auto-Update for Gumroad API Plugin
- * 
+ * GitHub Auto-Update for Creem.io API Plugin
+ *
  * Checks for updates directly from GitHub releases
  * and provides update notifications in WordPress admin
  */
@@ -13,15 +13,15 @@ if (!defined('ABSPATH')) {
 
 // Configuration
 $github_repo_owner = 'sinanisler';
-$github_repo_name  = 'gumroad-api';
-$plugin_slug       = 'gumroad-api';
-$plugin_file       = 'gumroad-api/gumroad-api.php';
+$github_repo_name  = 'creem-io-api';
+$plugin_slug       = 'creem-io-api';
+$plugin_file       = 'creem-io-api/creem-io-api.php';
 
 /**
  * Check for Plugin Updates from GitHub
  */
-add_filter('pre_set_site_transient_update_plugins', 'gumroad_api_check_github_update');
-function gumroad_api_check_github_update($transient) {
+add_filter('pre_set_site_transient_update_plugins', 'creem_io_api_check_github_update');
+function creem_io_api_check_github_update($transient) {
     global $github_repo_owner, $github_repo_name, $plugin_slug, $plugin_file;
 
     if (empty($transient->checked)) {
@@ -32,7 +32,7 @@ function gumroad_api_check_github_update($transient) {
     if (!function_exists('get_plugin_data')) {
         require_once ABSPATH . 'wp-admin/includes/plugin.php';
     }
-    
+
     $plugin_path = WP_PLUGIN_DIR . '/' . $plugin_file;
     $plugin_data = get_plugin_data($plugin_path);
     $current_version = $plugin_data['Version'];
@@ -102,8 +102,8 @@ function gumroad_api_check_github_update($transient) {
 /**
  * Provide Plugin Info for the "View version x.x.x details" popup
  */
-add_filter('plugins_api', 'gumroad_api_plugin_info_from_github', 10, 3);
-function gumroad_api_plugin_info_from_github($result, $action, $args) {
+add_filter('plugins_api', 'creem_io_api_plugin_info_from_github', 10, 3);
+function creem_io_api_plugin_info_from_github($result, $action, $args) {
     global $github_repo_owner, $github_repo_name, $plugin_slug, $plugin_file;
 
     if ($action !== 'plugin_information' || $args->slug !== $plugin_slug) {
@@ -154,13 +154,13 @@ function gumroad_api_plugin_info_from_github($result, $action, $args) {
     if (!function_exists('get_plugin_data')) {
         require_once ABSPATH . 'wp-admin/includes/plugin.php';
     }
-    
+
     $plugin_path = WP_PLUGIN_DIR . '/' . $plugin_file;
     $plugin_data = get_plugin_data($plugin_path);
 
     // Prepare changelog from release body
-    $changelog = !empty($release_data->body) 
-        ? wp_kses_post($release_data->body) 
+    $changelog = !empty($release_data->body)
+        ? wp_kses_post($release_data->body)
         : __('See GitHub release notes for details.', 'snn');
 
     // Prepare details for the WP plugin info popup
@@ -175,7 +175,7 @@ function gumroad_api_plugin_info_from_github($result, $action, $args) {
         'requires_php'  => '7.4',
         'download_link' => $download_url,
         'sections'      => array(
-            'description' => $plugin_data['Description'] ?? __('Connect your WordPress site with Gumroad to automatically create user accounts when customers make a purchase.', 'snn'),
+            'description' => $plugin_data['Description'] ?? __('Connect your WordPress site with Creem.io to automatically create user accounts when customers make a purchase.', 'snn'),
             'changelog'   => '<h4>Version ' . esc_html($latest_version) . '</h4>' . $changelog,
         ),
         'banners'       => array(),
@@ -189,30 +189,30 @@ function gumroad_api_plugin_info_from_github($result, $action, $args) {
 /**
  * Add JavaScript to admin footer to redirect version details link to GitHub
  */
-add_action('admin_footer', 'gumroad_api_github_redirect_version_link');
-function gumroad_api_github_redirect_version_link() {
+add_action('admin_footer', 'creem_io_api_github_redirect_version_link');
+function creem_io_api_github_redirect_version_link() {
     global $github_repo_owner, $github_repo_name;
-    
+
     $github_url = "https://github.com/{$github_repo_owner}/{$github_repo_name}/releases";
     ?>
     <script type="text/javascript">
         (function() {
             const githubUrl = '<?php echo esc_js($github_url); ?>';
-            const pluginSlug = 'gumroad-api';
-            
+            const pluginSlug = 'creem-io-api';
+
             function modifyLink(link) {
                 const href = link.getAttribute('href');
                 if (href && href.includes('plugin-install.php') && href.includes('tab=plugin-information') && href.includes(pluginSlug)) {
                     // Replace the href completely
                     link.href = githubUrl;
-                    
+
                     // Remove thickbox classes
                     link.classList.remove('thickbox', 'open-plugin-details-modal');
-                    
+
                     // Set target to open in new tab
                     link.target = '_blank';
                     link.rel = 'noopener noreferrer';
-                    
+
                     // Add click handler as extra safety
                     link.addEventListener('click', function(e) {
                         e.preventDefault();
@@ -222,20 +222,20 @@ function gumroad_api_github_redirect_version_link() {
                     }, true);
                 }
             }
-            
+
             function processLinks() {
                 // Target links in the plugins page
-                const links = document.querySelectorAll('.plugin-title a, .update-message a, a[aria-label*="Gumroad API"]');
+                const links = document.querySelectorAll('.plugin-title a, .update-message a, a[aria-label*="Creem.io API"]');
                 links.forEach(modifyLink);
             }
-            
+
             // Process on DOM ready
             if (document.readyState === 'loading') {
                 document.addEventListener('DOMContentLoaded', processLinks);
             } else {
                 processLinks();
             }
-            
+
             // Also watch for dynamically added links
             const observer = new MutationObserver(function(mutations) {
                 mutations.forEach(function(mutation) {
@@ -252,7 +252,7 @@ function gumroad_api_github_redirect_version_link() {
                     });
                 });
             });
-            
+
             observer.observe(document.body, {
                 childList: true,
                 subtree: true
