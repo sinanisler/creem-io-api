@@ -65,11 +65,15 @@ class Creem_API_WordPress {
         }
         ?>
 <style>
-.snn-creem-stats-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 20px; margin-bottom: 30px; }
-.snn-creem-stat-card { background: #fff; color: #333; padding: 25px; border-radius: 8px; border: 1px solid #ddd; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-.snn-creem-stat-card-header { font-size: 14px; margin-bottom: 10px; color: #666; }
-.snn-creem-stat-card-value { font-size: 22px; font-weight: bold; color: #000; }
-.snn-creem-stat-card-footer { font-size: 12px; margin-top: 10px; color: #666; }
+.snn-creem-stats-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 12px; margin-bottom: 30px; }
+@media (max-width: 1600px) { .snn-creem-stats-grid { grid-template-columns: repeat(4, 1fr); } }
+@media (max-width: 900px) { .snn-creem-stats-grid { grid-template-columns: repeat(2, 1fr); } }
+.snn-creem-stat-card { background: #fff; color: #333; padding: 16px 14px; border-radius: 8px; border: 1px solid #ddd; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; }
+.snn-creem-stat-card-header { font-size: 11px; margin-bottom: 6px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.snn-creem-stat-card-value { font-size: 18px; font-weight: bold; color: #000; }
+.snn-creem-stat-card-footer { font-size: 10px; margin-top: 6px; color: #666; }
+.snn-creem-dashboard-sections { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+@media (max-width: 1200px) { .snn-creem-dashboard-sections { grid-template-columns: 1fr; } }
 .snn-creem-section { padding: 20px; background: white; border: 1px solid #ccd0d4; margin-bottom: 20px; border-radius: 4px; }
 .snn-creem-section h2 { margin-top: 0; padding-bottom: 10px; border-bottom: 2px solid #000; }
 .snn-creem-recent-logs-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
@@ -1408,6 +1412,9 @@ class Creem_API_WordPress {
                 
             </div>
             
+            <!-- Recent Logs + Product Breakdown side by side -->
+            <div class="snn-creem-dashboard-sections">
+            
             <!-- Recent Logs Preview -->
             <div class="snn-creem-section">
                 <div class="snn-creem-recent-logs-header">
@@ -1438,9 +1445,9 @@ class Creem_API_WordPress {
             </div>
             
             <!-- Product Statistics -->
-            <?php if (!empty($stats['product_breakdown'])): ?>
             <div class="snn-creem-section">
                 <h2><?php _e('Product Breakdown', 'snn'); ?></h2>
+                <?php if (!empty($stats['product_breakdown'])): ?>
                 <table class="wp-list-table widefat fixed striped">
                     <thead>
                         <tr>
@@ -1457,8 +1464,12 @@ class Creem_API_WordPress {
                         <?php endforeach; ?>
                     </tbody>
                 </table>
+                <?php else: ?>
+                <p><?php _e('No product data yet.', 'snn'); ?></p>
+                <?php endif; ?>
             </div>
-            <?php endif; ?>
+            
+            </div><!-- .snn-creem-dashboard-sections -->
             
         </div>
         <?php
