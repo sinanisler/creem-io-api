@@ -653,8 +653,8 @@ class Creem_API_WordPress {
 
                             // Check for subscription states that require action
                             // canceled = subscription ended
-                            // unpaid = payment failed
-                            if (in_array($sub_status, array('canceled', 'unpaid'))) {
+                            // past_due = payment failed
+                            if (in_array($sub_status, array('canceled', 'past_due'))) {
                                 $sub_result = $this->handle_subscription_change($sale, $subscription);
                                 if (!is_wp_error($sub_result)) {
                                     $subscriptions_updated++;
@@ -741,7 +741,7 @@ class Creem_API_WordPress {
 
         $settings = get_option($this->option_name);
 
-        // Get users with creem subscriptions who are still active (not marked as expired/unpaid)
+        // Get users with creem subscriptions who are still active (not marked as expired/past_due)
         $args = array(
             'meta_query' => array(
                 'relation' => 'AND',
@@ -757,7 +757,7 @@ class Creem_API_WordPress {
                     ),
                     array(
                         'key' => 'creem_subscription_status',
-                        'value' => array('expired', 'unpaid'),
+                        'value' => array('expired', 'past_due'),
                         'compare' => 'NOT IN'
                     )
                 )
@@ -794,14 +794,14 @@ class Creem_API_WordPress {
                 continue;
             }
 
-            $sub_attrs = isset($subscription['attributes']) ? $subscription['attributes'] : array();
-            $sub_status = isset($sub_attrs['status']) ? $sub_attrs['status'] : '';
-            $ends_at = isset($sub_attrs['ends_at']) ? $sub_attrs['ends_at'] : '';
+            // Creem.io uses flat JSON structure — no 'attributes' wrapper
+            $sub_status = isset($subscription['status']) ? $subscription['status'] : '';
+            $ends_at = isset($subscription['current_period_end_date']) ? $subscription['current_period_end_date'] : '';
 
             $checked_count++;
 
             // Check if subscription needs action
-            if (in_array($sub_status, array('expired', 'unpaid'))) {
+            if (in_array($sub_status, array('expired', 'past_due'))) {
                 // Subscription has ended, remove roles
                 $result = $this->handle_subscription_change($sale_data, $subscription);
                 if (!is_wp_error($result)) {
@@ -886,42 +886,6 @@ class Creem_API_WordPress {
                 'note' => 'Go to Settings and enable Auto Create Users checkbox for product ID: ' . $product_id
             ));
             return new WP_Error('auto_create_disabled', 'Auto create users not enabled for this product');
-        }
-        
-        // Check if auto user creation is enabled for THIS specific product
-        // Try both original and normalized product IDs to handle type mismatches
-        $is_auto_create_enabled = false;
-        if (isset($product_auto_create[$product_id]) && $product_auto_create[$product_id]) {
-            $is_auto_create_enabled = true;
-        } elseif (isset($product_auto_create[$product_id_normalized]) && $product_auto_create[$product_id_normalized]) {
-            $is_auto_create_enabled = true;
-            $product_id = $product_id_normalized; // Use normalized version
-        }
-        
-        if (!$is_auto_create_enabled) {
-            // Get list of enabled products with their details for debugging
-            $enabled_products = array();
-            foreach ($product_auto_create as $pid => $enabled) {
-                if ($enabled) {
-                    $enabled_products[$pid] = array(
-                        'id' => $pid,
-                        'type' => gettype($pid)
-                    );
-                }
-            }
-            
-            $this->log_activity('User creation skipped', array(
-                'reason' => 'Auto create users is not enabled for this product',
-                'email' => $email,
-                'product_name' => $log_product_name,
-                'product_id' => $log_product_id,
-                'product_id_type' => gettype($product_id),
-                'enabled_products' => $enabled_products,
-                'total_enabled_products' => count(array_filter($product_auto_create)),
-                'all_configured_products' => array_keys($product_auto_create),
-                'note' => 'Enable auto-create for this product in Settings > User Management > Product-Specific Configuration'
-            ));
-            return new WP_Error('auto_create_disabled', 'Automatic user creation is not enabled for this product');
         }
 
         // Check if user exists
@@ -1248,7 +1212,7 @@ class Creem_API_WordPress {
                 'email' => $email,
                 'sale_id' => $sale_id,
                 'product' => $product_name,
-                'refunded_at' => $refunded_at
+                'refunded_at' => current_time('mysql')
             ));
         } else {
             // Remove roles assigned by creem
@@ -1272,7 +1236,7 @@ class Creem_API_WordPress {
                 'email' => $email,
                 'sale_id' => $sale_id,
                 'product' => $product_name,
-                'refunded_at' => $refunded_at,
+                'refunded_at' => current_time('mysql'),
                 'roles_removed' => $roles_removed
             ));
         }
@@ -1334,7 +1298,7 @@ class Creem_API_WordPress {
                 'subscription_id' => $subscription_id,
                 'subscription_status' => $sub_status,
                 'product' => $product_name,
-                'ends_at' => $ends_at
+                'ends_at' => $current_period_end
             ));
         } else {
             // Remove roles assigned by creem
@@ -1353,8 +1317,8 @@ class Creem_API_WordPress {
             // Update subscription status in user meta
             update_user_meta($user->ID, 'creem_subscription_status', $sub_status);
             update_user_meta($user->ID, 'creem_subscription_ended_date', current_time('mysql'));
-            if (!empty($ends_at)) {
-                update_user_meta($user->ID, 'creem_subscription_ends_at', $ends_at);
+            if (!empty($current_period_end)) {
+                update_user_meta($user->ID, 'creem_subscription_ends_at', $current_period_end);
             }
 
             $this->log_activity('Subscription ended - roles removed', array(
@@ -1365,8 +1329,8 @@ class Creem_API_WordPress {
                 'product' => $product_name,
                 'action' => $action,
                 'roles_removed' => $roles_removed,
-                'ends_at' => $ends_at,
-                'cancelled' => $cancelled
+                'ends_at' => $current_period_end,
+                'canceled_at' => $canceled_at
             ));
         }
 
