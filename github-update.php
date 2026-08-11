@@ -14,15 +14,21 @@ if (!defined('ABSPATH')) {
 // Configuration
 $github_repo_owner = 'sinanisler';
 $github_repo_name  = 'creem-io-api';
-$plugin_slug       = 'creem-io-api';
-$plugin_file       = 'creem-io-api/creemio-api.php';
+$github_asset_name = 'creemio-api.zip'; // Must match the actual asset produced by the release workflow (verified: release v0.6 publishes 'creemio-api.zip', NOT 'creem-io-api.zip')
+
+// Derive the real installed slug + main-file path from THIS file, so the updater
+// works no matter what folder name the plugin is installed under (e.g. "creemio-api"
+// vs "creem-io-api"). Hardcoding the folder here caused a file_get_contents() warning
+// on every admin page load and broke auto-updates whenever the folder name differed.
+$plugin_slug = dirname( plugin_basename( __FILE__ ) );
+$plugin_file = $plugin_slug . '/creemio-api.php';
 
 /**
  * Check for Plugin Updates from GitHub
  */
 add_filter('pre_set_site_transient_update_plugins', 'creem_io_api_check_github_update');
 function creem_io_api_check_github_update($transient) {
-    global $github_repo_owner, $github_repo_name, $plugin_slug, $plugin_file;
+    global $github_repo_owner, $github_repo_name, $plugin_slug, $plugin_file, $github_asset_name;
 
     if (empty($transient->checked)) {
         return $transient;
@@ -60,7 +66,7 @@ function creem_io_api_check_github_update($transient) {
     }
 
     $latest_version = ltrim($release_data->tag_name, 'vV');
-    $expected_asset_name = $plugin_slug . '.zip';
+    $expected_asset_name = $github_asset_name;
     $download_url = '';
 
     // Find the correct asset (plugin zip file)
@@ -104,7 +110,7 @@ function creem_io_api_check_github_update($transient) {
  */
 add_filter('plugins_api', 'creem_io_api_plugin_info_from_github', 10, 3);
 function creem_io_api_plugin_info_from_github($result, $action, $args) {
-    global $github_repo_owner, $github_repo_name, $plugin_slug, $plugin_file;
+    global $github_repo_owner, $github_repo_name, $plugin_slug, $plugin_file, $github_asset_name;
 
     if ($action !== 'plugin_information' || $args->slug !== $plugin_slug) {
         return $result;
@@ -132,7 +138,7 @@ function creem_io_api_plugin_info_from_github($result, $action, $args) {
     }
 
     $latest_version      = ltrim($release_data->tag_name, 'vV');
-    $expected_asset_name = $plugin_slug . '.zip';
+    $expected_asset_name = $github_asset_name;
     $download_url        = '';
 
     // Find the correct asset
@@ -191,14 +197,14 @@ function creem_io_api_plugin_info_from_github($result, $action, $args) {
  */
 add_action('admin_footer', 'creem_io_api_github_redirect_version_link');
 function creem_io_api_github_redirect_version_link() {
-    global $github_repo_owner, $github_repo_name;
+    global $github_repo_owner, $github_repo_name, $plugin_slug;
 
     $github_url = "https://github.com/{$github_repo_owner}/{$github_repo_name}/releases";
     ?>
     <script type="text/javascript">
         (function() {
             const githubUrl = '<?php echo esc_js($github_url); ?>';
-            const pluginSlug = 'creem-io-api';
+            const pluginSlug = '<?php echo esc_js($plugin_slug); ?>';
 
             function modifyLink(link) {
                 const href = link.getAttribute('href');

@@ -3,7 +3,7 @@
  * Plugin Name: Creem.io API to WordPress Sync
  * Plugin URI: https://github.com/sinanisler/creem-io-api
  * Description: Automatically create WordPress users from Creem.io sales
- * Version: 0.6
+ * Version: 0.7
  * Author: sinanisler
  * Author URI: https://github.com/sinanisler
  * License: GPL v2 or later
@@ -22,7 +22,48 @@ class Creem_API_WordPress {
 
     private $option_name = 'creem_api_settings';
     private $log_option_name = 'creem_api_logs';
-    
+
+    /**
+     * Subscription statuses that mean access has ended. When a subscription has one
+     * of these statuses AND its billing period has ended, the user's product roles
+     * are removed. Shared by the removal logic, the re-check meta-query, the
+     * dashboard "Active Subscriptions" SQL and the renewal redirect.
+     *
+     * The plugin polls the REST API only (no webhooks), so this list is derived
+     * from the documented SubscriptionEntity.status enum, which is exactly:
+     *     active, canceled, unpaid, paused, trialing
+     * (verified against api.creem.io / OpenAPI + live data). Of those, the two
+     * terminal statuses that should end access are 'canceled' and 'unpaid'.
+     *
+     * 'paused' is NOT here: it is handled separately (downgrade to the default
+     * role, restored on resume). 'active' and 'trialing' keep full access.
+     *
+     * 'unpaid' is included but still gated by creem_period_ended(), so a customer
+     * keeps access for the period they already paid for and is only revoked once
+     * that period has elapsed.
+     *
+     * Note: 'expired', 'scheduled_cancel' and 'past_due' are NOT returned by the
+     * REST subscription endpoint — ended subscriptions come back as 'canceled'
+     * (confirmed against production data). They were previously listed here as
+     * defensive insurance based on webhook/CLI references; removed to keep this
+     * list precise. No behaviour change in practice, as those statuses were
+     * unreachable via REST. If Creem ever introduces a new terminal REST status,
+     * add it here.
+     */
+    private static $ENDED_STATUSES = array(
+        'canceled', 'unpaid',
+    );
+
+    /**
+     * Per-request memoization cache of fetched subscriptions, keyed by
+     * subscription_id. Stores the decoded array on success and the WP_Error/null
+     * result on failure, so a subscription that appears in several transactions
+     * (or across check_existing_subscriptions) is fetched at most once per phase.
+     * Lives only for the current PHP request (each WP cron run is a fresh
+     * process), so transient API failures are always retried on the next run.
+     */
+    private $subscription_cache = array();
+
     public function __construct() {
         // Admin menu
         add_action('admin_menu', array($this, 'add_admin_menu'));
@@ -41,10 +82,16 @@ class Creem_API_WordPress {
         add_action('wp_ajax_creem_clear_logs', array($this, 'clear_logs'));
         add_action('wp_ajax_creem_fetch_products', array($this, 'fetch_products'));
         add_action('wp_ajax_creem_uninstall_plugin', array($this, 'uninstall_plugin_data'));
+        add_action('wp_ajax_creem_billing_link', array($this, 'ajax_billing_link'));
         
         // Add admin styles
         add_action('admin_head', array($this, 'admin_styles'));
-        
+
+        // Ensure the activity-log option is never autoloaded (self-heals existing
+        // installs created with autoload=yes). Not activation-only: WordPress does
+        // not run activation hooks during auto-updates.
+        add_action('admin_init', array($this, 'ensure_logs_not_autoloaded'));
+
         // Add plugin row meta for uninstall link
         add_filter('plugin_row_meta', array($this, 'add_plugin_row_meta'), 10, 2);
 
@@ -60,20 +107,16 @@ class Creem_API_WordPress {
      */
     public function admin_styles() {
         $screen = get_current_screen();
-        if (strpos($screen->id, 'creem-api') === false) {
+        if (!$screen || strpos($screen->id, 'creem-api') === false) {
             return;
         }
         ?>
 <style>
-.snn-creem-stats-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 10px; margin-bottom: 30px; }
-@media (max-width: 1200px) { .snn-creem-stats-grid { grid-template-columns: repeat(4, 1fr); } }
-@media (max-width: 600px) { .snn-creem-stats-grid { grid-template-columns: repeat(2, 1fr); } }
-.snn-creem-stat-card { background: #fff; color: #333; padding: 12px 8px; border-radius: 8px; border: 1px solid #ddd; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; }
-.snn-creem-stat-card-header { font-size: 10px; margin-bottom: 4px; color: #666; text-transform: uppercase; letter-spacing: 0.3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.snn-creem-stat-card-value { font-size: 17px; font-weight: bold; color: #000; line-height: 1.2; }
-.snn-creem-stat-card-footer { font-size: 10px; margin-top: 4px; color: #666; }
-.snn-creem-dashboard-sections { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
-@media (max-width: 1200px) { .snn-creem-dashboard-sections { grid-template-columns: 1fr; } }
+.snn-creem-stats-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 20px; margin-bottom: 30px; }
+.snn-creem-stat-card { background: #fff; color: #333; padding: 25px; border-radius: 8px; border: 1px solid #ddd; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+.snn-creem-stat-card-header { font-size: 14px; margin-bottom: 10px; color: #666; }
+.snn-creem-stat-card-value { font-size: 22px; font-weight: bold; color: #000; }
+.snn-creem-stat-card-footer { font-size: 12px; margin-top: 10px; color: #666; }
 .snn-creem-section { padding: 20px; background: white; border: 1px solid #ccd0d4; margin-bottom: 20px; border-radius: 4px; }
 .snn-creem-section h2 { margin-top: 0; padding-bottom: 10px; border-bottom: 2px solid #000; }
 .snn-creem-recent-logs-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
@@ -162,7 +205,8 @@ class Creem_API_WordPress {
             'handle_subscriptions' => true,
             'subscription_cancellation_action' => 'remove_roles',
             'subscription_renewal_page' => '', // Page ID for subscription renewal redirect
-            'log_rotation_days' => 30
+            'log_rotation_days' => 30,
+            'debug_mode' => false // Log full raw API payloads (off by default to keep the log small)
         );
 
         if (!get_option($this->option_name)) {
@@ -239,10 +283,10 @@ class Creem_API_WordPress {
      * Plugin deactivation
      */
     public function deactivate() {
-        $timestamp = wp_next_scheduled('creem_api_check_sales');
-        if ($timestamp) {
-            wp_unschedule_event($timestamp, 'creem_api_check_sales');
-        }
+        // Clear ALL scheduled instances of our hook (not just the next one).
+        // wp_next_scheduled() would only remove a single event, leaving any
+        // duplicates (double-activation, restored DB, etc.) scheduled.
+        wp_clear_scheduled_hook('creem_api_check_sales');
     }
     
     /**
@@ -250,7 +294,7 @@ class Creem_API_WordPress {
      */
     public function add_custom_cron_interval($schedules) {
         $settings = get_option($this->option_name);
-        $interval = isset($settings['cron_interval']) ? intval($settings['cron_interval']) : 120;
+        $interval = max(30, isset($settings['cron_interval']) ? intval($settings['cron_interval']) : 120);
         
         $schedules['creem_custom'] = array(
             'interval' => $interval,
@@ -264,10 +308,11 @@ class Creem_API_WordPress {
      * Schedule cron job
      */
     private function schedule_cron() {
-        $timestamp = wp_next_scheduled('creem_api_check_sales');
-        if ($timestamp) {
-            wp_unschedule_event($timestamp, 'creem_api_check_sales');
-        }
+        // Clear ALL scheduled instances before re-scheduling. This runs on
+        // activation and every settings save (e.g. when the interval changes),
+        // so it must wipe any duplicates (double-activation, restored DB, ...),
+        // not just the next event.
+        wp_clear_scheduled_hook('creem_api_check_sales');
 
         wp_schedule_event(time(), 'creem_custom', 'creem_api_check_sales');
     }
@@ -351,33 +396,85 @@ class Creem_API_WordPress {
     }
 
     /**
-     * Parse Creem.io transactions response
-     * Creem.io uses simple JSON format, not JSON:API
+     * Normalize a Creem list/search response into {items, has_more}. The
+     * documented and observed shape on every list endpoint this plugin uses
+     * (products, transactions, subscriptions search) is:
+     *     {"items": [...], "pagination": {"next_page": <num|null>, ...}}
+     * with page_number / page_size query params (verified against api.creem.io).
+     *
+     * A second shape — {"object":"list","data":[...],"has_more":bool} — is also
+     * accepted defensively, so a future API change never fails silently. If
+     * neither shape is recognized, an explicit "Unexpected API list response
+     * shape" activity log is emitted instead of the plugin silently processing
+     * zero rows.
+     *
+     * @return array{items:array,has_more:bool}
      */
-    private function parse_creem_transactions($json_data) {
-        $transactions = array();
-        if (!isset($json_data['items']) || !is_array($json_data['items'])) {
-            return $transactions;
+    private function parse_creem_list($data, $context = '') {
+        $items = array();
+        $has_more = false;
+        $recognized = false;
+
+        if (is_array($data)) {
+            // Defensive alternative shape: {"data":[...],"has_more":bool}.
+            // Not used by products/transactions/subscriptions, but accepted so a
+            // future API change never fails silently.
+            if (isset($data['data']) && is_array($data['data'])) {
+                $items = $data['data'];
+                $has_more = !empty($data['has_more']);
+                $recognized = true;
+            }
+            // Documented + observed shape: {"items":[...],"pagination":{"next_page":...}}.
+            // Overrides the defensive shape when 'items' is present (the real shape).
+            if (isset($data['items']) && is_array($data['items'])) {
+                $items = $data['items'];
+                $has_more = !empty($data['pagination']['next_page']);
+                $recognized = true;
+            }
         }
 
-        foreach ($json_data['items'] as $item) {
-            // Return the entire raw item
-            $transactions[] = $item;
+        if (!$recognized) {
+            $this->log_activity('Unexpected API list response shape', array(
+                'context' => $context,
+                'top_level_keys' => is_array($data) ? array_values(array_map('strval', array_keys($data))) : array(),
+            ));
         }
-        return $transactions;
+
+        return array('items' => $items, 'has_more' => $has_more);
     }
 
     /**
      * Extract subscription ID from transaction
      * In Creem.io, subscription ID is directly in the transaction object
      */
-    private function extract_subscription_id($transaction_item, $api_key = '') {
+    private function extract_subscription_id($transaction_item) {
         // Direct field access for Creem.io
         if (isset($transaction_item['subscription']) && !empty($transaction_item['subscription'])) {
             return $transaction_item['subscription'];
         }
 
         return '';
+    }
+
+    /**
+     * Returns true when a Creem subscription period end date is in the past.
+     * Expects the ISO 8601 format returned by the API, e.g.
+     * "2026-08-05T23:22:36.000Z". On empty or unparseable input returns false so we
+     * never revoke access based on missing data.
+     */
+    private function creem_period_ended($period_end_date) {
+        if (empty($period_end_date) || !is_string($period_end_date)) {
+            return false;
+        }
+        $timestamp = strtotime($period_end_date);
+        if ($timestamp === false) {
+            // Fallback: drop the milliseconds if strtotime choked on the ".000Z" part.
+            $timestamp = strtotime(preg_replace('/\.\d{3}Z$/', 'Z', $period_end_date));
+        }
+        if ($timestamp === false) {
+            return false;
+        }
+        return $timestamp <= time();
     }
 
     /**
@@ -388,12 +485,19 @@ class Creem_API_WordPress {
             return new WP_Error('invalid_params', 'API key and subscription ID are required');
         }
 
+        // Per-request memoization: avoid refetching the same subscription (success
+        // or failure) within a single phase. The invalid_params guard above is not
+        // cached because it is a programming error, not a fetch result.
+        if (array_key_exists($subscription_id, $this->subscription_cache)) {
+            return $this->subscription_cache[$subscription_id];
+        }
+
         // Determine which API URL to use based on mode
         $settings = get_option($this->option_name);
         $test_mode = isset($settings['test_mode']) && $settings['test_mode'];
         $base_url = $test_mode ? 'https://test-api.creem.io' : 'https://api.creem.io';
         
-        $url = "{$base_url}/v1/subscriptions?subscription_id={$subscription_id}";
+        $url = "{$base_url}/v1/subscriptions?subscription_id=" . rawurlencode($subscription_id);
 
         $this->log_activity('FETCHING SUBSCRIPTION', array(
             'url' => $url,
@@ -410,44 +514,42 @@ class Creem_API_WordPress {
                 'url' => $url,
                 'error' => $response->get_error_message()
             ));
+            $this->subscription_cache[$subscription_id] = $response;
             return $response;
         }
 
         $body = wp_remote_retrieve_body($response);
         $data = json_decode($body, true);
 
-        // Log raw subscription data for debugging
-        $this->log_activity('RAW SUBSCRIPTION RESPONSE', array(
+        // Log subscription data: full payload only in debug mode, otherwise a compact
+        // summary so the activity log is not bloated by every subscription fetch.
+        $this->log_activity($this->is_debug_mode() ? 'RAW SUBSCRIPTION RESPONSE' : 'SUBSCRIPTION RESPONSE', array(
             'subscription_id' => $subscription_id,
             'url' => $url,
-            'raw_response' => $data
+            'status' => isset($data['status']) ? $data['status'] : '',
+            'product_id' => isset($data['product']['id']) ? $data['product']['id'] : '',
+            'customer_email' => isset($data['customer']['email']) ? $data['customer']['email'] : '',
+            'current_period_end_date' => isset($data['current_period_end_date']) ? $data['current_period_end_date'] : '',
+            'raw_response' => $this->is_debug_mode() ? $data : null,
         ));
 
         if (!isset($data['id'])) {
-            $error_msg = isset($data['error']) ? $data['error'] : 'Unknown API error';
+            // Use the shared error extractor so an array/object 'error' field
+            // (some APIs return it that way) doesn't become a non-string
+            // WP_Error message.
+            $error_msg = $this->get_api_error_message($data);
             $this->log_activity('Subscription API error', array(
                 'subscription_id' => $subscription_id,
                 'error' => $error_msg,
                 'response' => $data
             ));
-            return new WP_Error('api_error', $error_msg);
+            $err = new WP_Error('api_error', $error_msg);
+            $this->subscription_cache[$subscription_id] = $err;
+            return $err;
         }
 
+        $this->subscription_cache[$subscription_id] = $data;
         return $data;
-    }
-
-    /**
-     * Parse Creem.io customer response
-     */
-    private function parse_creem_customer($json_data) {
-        if (!isset($json_data['id'])) {
-            return null;
-        }
-        return array(
-            'id' => isset($json_data['id']) ? $json_data['id'] : '',
-            'name' => isset($json_data['name']) ? $json_data['name'] : '',
-            'email' => isset($json_data['email']) ? $json_data['email'] : ''
-        );
     }
 
     /**
@@ -516,6 +618,61 @@ class Creem_API_WordPress {
     }
 
     /**
+     * Whether a Creem transaction represents a FULL refund / chargeback that
+     * should revoke access. Detection is intentionally multi-pronged because
+     * Creem may represent a refund either as a status on the original
+     * transaction or as a separate transaction (to be confirmed from real
+     * debug payloads):
+     *   1. explicit status: refunded | chargeback
+     *   2. a standalone refund transaction (type indicating a refund)
+     *      [Phase 0 TODO: confirm the exact `type` value and extend if needed]
+     *   3. fallback: no status but refunded_amount >= amount_paid
+     * Partial refunds (status=partially_refunded, or refunded_amount less than
+     * amount_paid) are NOT full refunds and must retain access.
+     */
+    private function transaction_is_full_refund($sale) {
+        if (!is_array($sale)) {
+            return false;
+        }
+
+        $sale_status     = isset($sale['status']) ? $sale['status'] : '';
+        $refunded_amount = isset($sale['refunded_amount']) ? floatval($sale['refunded_amount']) : 0;
+        $amount_paid     = isset($sale['amount_paid']) ? floatval($sale['amount_paid']) : 0;
+        $type            = isset($sale['type']) ? $sale['type'] : '';
+
+        // Defensive partial-refund handling. The docs only document transaction
+        // status='refunded' for FULL refunds (refunded_amount == amount_paid); the
+        // status of a partially refunded transaction is undocumented
+        // ('partially_refunded' is an ORDER status, not a transaction status). If
+        // Creem ever marks a transaction 'refunded' while refunded_amount <
+        // amount_paid, treat it as a PARTIAL refund (retain access) instead of
+        // revoking everything. Purely protective: for documented full refunds
+        // (refunded_amount >= amount_paid) the result is unchanged.
+        if ($sale_status === 'chargeback') {
+            return true;
+        }
+        if ($sale_status === 'refunded') {
+            if ($refunded_amount > 0 && $amount_paid > 0 && $refunded_amount < $amount_paid) {
+                return false; // partial refund reported under 'refunded'
+            }
+            return true;
+        }
+
+        // Standalone refund transaction marker (defensive default; refine after
+        // confirming the real field shape from debug logs).
+        if ($type === 'refund') {
+            return true;
+        }
+
+        // Fallback when the status field is absent but the amounts say "fully refunded".
+        if ($sale_status === '' && $refunded_amount > 0 && $amount_paid > 0 && $refunded_amount >= $amount_paid) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
      * Check recent sales via API (cron job)
      */
     public function check_recent_sales() {
@@ -533,10 +690,15 @@ class Creem_API_WordPress {
         $test_mode = isset($settings['test_mode']) && $settings['test_mode'];
         $base_url = $test_mode ? 'https://test-api.creem.io' : 'https://api.creem.io';
 
-        // Fetch ALL transactions via pagination so no sales are ever missed
+        // Fetch transactions via pagination. sales_limit caps the number of
+        // PROCESSABLE transactions (subscriptions), not raw transactions: one-time
+        // payments (type=payment) are skipped below, so they must not consume the
+        // budget and crowd real subscriptions out of the fetch window.
         $page_size = 100; // Max per page
         $page_number = 1;
         $transactions = array();
+        $processable_count = 0;
+        $max_pages = 10; // hard safety cap so a flood of one-time payments can't paginate forever
 
         do {
             $orders_url = "{$base_url}/v1/transactions/search?page_size={$page_size}&page_number={$page_number}";
@@ -570,7 +732,8 @@ class Creem_API_WordPress {
                 'http_code' => $http_code,
                 'page' => $page_number,
                 'items_on_page' => isset($data['items']) ? count($data['items']) : 0,
-                'raw_response' => $data
+                'has_next_page' => !empty($data['pagination']['next_page']),
+                'raw_response' => $this->is_debug_mode() ? $data : null
             ));
 
             if ($http_code === 401) {
@@ -585,26 +748,38 @@ class Creem_API_WordPress {
                 return;
             }
 
-            if (!isset($data['items']) || !is_array($data['items'])) {
-                $this->log_activity('Transactions API error', array('error' => 'Invalid response structure', 'response' => $data));
-                return;
-            }
+            // Normalize the list response (accepts both the documented
+            // {object,data,has_more} shape and the empirical {items,pagination}
+            // shape). Emits an explicit "Unexpected ... shape" log if neither is
+            // recognized, so an API change is never silent.
+            $list = $this->parse_creem_list($data, 'transactions/search');
+            $page_transactions = $list['items'];
 
-            $page_transactions = $this->parse_creem_transactions($data);
             $transactions = array_merge($transactions, $page_transactions);
 
-            // Stop if we have enough or there are no more pages
-            $has_next_page = !empty($data['pagination']['next_page']);
+            // Count processable (non-payment) transactions on this page toward the
+            // budget, so one-time payments don't crowd subscriptions out of sales_limit.
+            foreach ($page_transactions as $pt) {
+                if (($pt['type'] ?? '') !== 'payment') {
+                    $processable_count++;
+                }
+            }
+
+            // Stop if there are no more pages (recognized via either shape), or we
+            // have enough processable transactions, or we hit the hard page cap.
+            $has_next_page = $list['has_more'];
             $page_number++;
 
-        } while ($has_next_page && count($transactions) < $sales_limit);
+        } while ($has_next_page && $processable_count < $sales_limit && $page_number <= $max_pages);
 
-        // Log first transaction for debugging
+        // Log first transaction for debugging (full payload only in debug mode)
         if (!empty($transactions)) {
             $this->log_activity('RAW TRANSACTION FROM API', array(
-                'raw_transaction' => $transactions[0],
+                'transaction_id' => isset($transactions[0]['id']) ? $transactions[0]['id'] : '',
+                'type' => isset($transactions[0]['type']) ? $transactions[0]['type'] : '',
+                'status' => isset($transactions[0]['status']) ? $transactions[0]['status'] : '',
                 'total_fetched' => count($transactions),
-                'IMPORTANT' => 'This is the COMPLETE unmodified transaction data from Creem.io'
+                'raw_transaction' => $this->is_debug_mode() ? $transactions[0] : null
             ));
         }
 
@@ -612,16 +787,26 @@ class Creem_API_WordPress {
             $new_sales_count = 0;
             $refunds_processed = 0;
             $subscriptions_updated = 0;
+            $one_time_skipped = 0;
+            $active_subs_by_email = array(); // B1: detect customers with 2+ active subscriptions
 
             foreach ($transactions as $sale) {
                 $sale_id = isset($sale['id']) ? $sale['id'] : '';
+
+                // One-time payments (type=payment) are out of scope: Creem delivers
+                // digital files natively, and these transactions carry no subscription
+                // (hence no resolvable email/product). Skip them before any API call so
+                // they don't spam the logs as errors every cron run.
+                if (($sale['type'] ?? '') === 'payment') {
+                    $one_time_skipped++;
+                    continue;
+                }
 
                 // Creem.io uses simple JSON structure, no attributes wrapper
                 $customer_email = '';
                 if (isset($sale['customer'])) {
                     // Customer might be ID string or object
                     if (is_string($sale['customer'])) {
-                        // TODO: Fetch customer details if needed
                         $customer_email = '';
                     } else if (is_array($sale['customer']) && isset($sale['customer']['email'])) {
                         $customer_email = sanitize_email($sale['customer']['email']);
@@ -629,80 +814,149 @@ class Creem_API_WordPress {
                 }
                 $email = $customer_email;
 
-                // Handle refunds - check for refunded_amount in Creem.io transaction
+                // Fetch the subscription whenever a subscription_id is present. The
+                // transaction carries no product and "customer" is only a string ID, so
+                // the subscription is the ONLY source of email + product. This must run
+                // regardless of the "Handle Subscriptions" toggle (that toggle only gates
+                // the auto-revoke-on-end logic below); otherwise, with the toggle OFF, no
+                // user gets created (invalid_email) and refunds can't resolve the user.
+                $subscription = null;
+                $subscription_id = $this->extract_subscription_id($sale);
+                if (!empty($subscription_id)) {
+                    // Memoization now lives inside fetch_subscription()
+                    // ($subscription_cache), so multiple transactions sharing a
+                    // subscription_id hit the Creem API only once per phase.
+                    $fetched = $this->fetch_subscription($access_token, $subscription_id);
+                    if ($fetched && !is_wp_error($fetched)) {
+                        $subscription = $fetched;
+                    }
+                }
+
+                // Resolve the customer email from the subscription when the transaction
+                // did not carry one.
+                if (empty($email) && is_array($subscription) && isset($subscription['customer']['email'])) {
+                    $email = sanitize_email($subscription['customer']['email']);
+                }
+
+                // B1: track active subscriptions per customer so we can warn when a
+                // single email holds 2+ concurrent active subscriptions (the plugin
+                // assumes 1 per customer; concurrent subs are not fully reconciled).
+                if (!empty($email) && !empty($subscription_id) && is_array($subscription)) {
+                    $tmp_sub_status = isset($subscription['status']) ? $subscription['status'] : '';
+                    if (!in_array($tmp_sub_status, self::$ENDED_STATUSES, true)) {
+                        if (!isset($active_subs_by_email[$email])) {
+                            $active_subs_by_email[$email] = array();
+                        }
+                        $active_subs_by_email[$email][$subscription_id] = true;
+                    }
+                }
+
+                // Email unresolvable: the transaction carries none (customer is a
+                // string ID) and the subscription fetch failed / has no customer
+                // email. Skip with a concise log instead of failing repeatedly inside
+                // process_sale()/handle_refund() (which would reject it anyway with
+                // 'invalid_email' from these same sources). It is retried on the next
+                // cron run, so a transient API outage is never permanently lost.
+                if (empty($email)) {
+                    $this->log_activity('Email unresolvable - transaction skipped', array(
+                        'sale_id' => $sale_id,
+                        'subscription_id' => $subscription_id,
+                    ));
+                    continue;
+                }
+
+                // Handle refunds. The Creem transaction carries a `status` field that
+                // distinguishes a full refund (status=refunded) and a dispute
+                // (status=chargeback) from a partial refund (status=partially_refunded).
+                // Only a FULL refund / chargeback revokes access; a partial refund leaves
+                // the mostly-paid customer intact and is only logged. Detection lives in
+                // transaction_is_full_refund() (status, standalone refund tx, or amount fallback).
                 if (isset($settings['handle_refunds']) && $settings['handle_refunds']) {
-                    // In Creem.io, check if refunded_amount > 0
                     $refunded_amount = isset($sale['refunded_amount']) ? floatval($sale['refunded_amount']) : 0;
-                    if ($refunded_amount > 0) {
-                        $refund_result = $this->handle_refund($sale);
+
+                    if ($this->transaction_is_full_refund($sale)) {
+                        $refund_result = $this->handle_refund($sale, $subscription);
                         if (!is_wp_error($refund_result)) {
                             $refunds_processed++;
+                        }
+                        continue;
+                    } elseif ($refunded_amount > 0) {
+                        // Partial refund: the customer still paid most of the amount, so
+                        // access is retained. Logged for visibility and not processed as
+                        // a fresh sale.
+                        $this->log_activity('Partial refund - access retained', array(
+                            'sale_id' => $sale_id,
+                            'subscription_id' => $subscription_id,
+                            'status' => isset($sale['status']) ? $sale['status'] : '',
+                            'refunded_amount' => $refunded_amount,
+                            'amount_paid' => isset($sale['amount_paid']) ? floatval($sale['amount_paid']) : 0,
+                        ));
+                        continue;
+                    }
+                }
+
+                // Handle subscription status changes using the subscription fetched above.
+                // Access is removed only for ended statuses once the paid period is over.
+                // Gated by the toggle: "Handle Subscriptions" controls auto-revoke only
+                // (email/product resolution above runs regardless).
+                if (isset($settings['handle_subscriptions']) && $settings['handle_subscriptions'] && is_array($subscription)) {
+                    $sub_status = isset($subscription['status']) ? $subscription['status'] : '';
+                    $current_period_end = isset($subscription['current_period_end_date']) ? $subscription['current_period_end_date'] : '';
+
+                    if (in_array($sub_status, self::$ENDED_STATUSES, true)
+                        && $this->creem_period_ended($current_period_end)
+                    ) {
+                        $sub_result = $this->handle_subscription_change($sale, $subscription);
+                        if (!is_wp_error($sub_result)) {
+                            $subscriptions_updated++;
                         }
                         continue;
                     }
                 }
 
-                // Handle subscription status changes - fetch actual subscription data
-                if (isset($settings['handle_subscriptions']) && $settings['handle_subscriptions']) {
-                    // Extract subscription ID (pass api_key)
-                    $subscription_id = $this->extract_subscription_id($sale, $access_token);
-
-                    if (!empty($subscription_id)) {
-                        // Fetch the actual subscription to check its status
-                        $subscription = $this->fetch_subscription($access_token, $subscription_id);
-
-                        if ($subscription && !is_wp_error($subscription)) {
-                            // Creem.io subscription status
-                            $sub_status = isset($subscription['status']) ? $subscription['status'] : '';
-
-                            // Check for subscription states that require action
-                            // canceled = subscription ended
-                            // past_due = payment failed
-                            if (in_array($sub_status, array('canceled', 'past_due'))) {
-                                $sub_result = $this->handle_subscription_change($sale, $subscription);
-                                if (!is_wp_error($sub_result)) {
-                                    $subscriptions_updated++;
-                                }
-                                continue;
-                            } else if ($sub_status === 'scheduled_cancel') {
-                                // scheduled_cancel in Creem means it will cancel at period end
-                                $current_period_end = isset($subscription['current_period_end_date']) ? $subscription['current_period_end_date'] : '';
-                                if (!empty($current_period_end) && strtotime($current_period_end) <= time()) {
-                                    // Period ended, treat as cancelled
-                                    $sub_result = $this->handle_subscription_change($sale, $subscription);
-                                    if (!is_wp_error($sub_result)) {
-                                        $subscriptions_updated++;
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                    }
+                // A full refund / chargeback must NEVER be processed as a fresh sale,
+                // even when "Handle Refunds" is OFF. Without this guard, disabling
+                // refund handling lets a refunded transaction fall through to
+                // process_sale() and create/re-grant access for a refunded purchase.
+                // The refund-action block above handles it when the toggle is ON; this
+                // covers the OFF case and any other fall-through.
+                if ($this->transaction_is_full_refund($sale)) {
+                    continue;
                 }
 
                 // If transaction customer is a string ID, inject full customer from subscription
                 if (isset($sale['customer']) && is_string($sale['customer'])
-                    && isset($subscription) && is_array($subscription) && !is_wp_error($subscription)
+                    && is_array($subscription)
                     && isset($subscription['customer']) && is_array($subscription['customer'])) {
                     $sale['customer'] = $subscription['customer'];
                     $email = isset($subscription['customer']['email']) ? sanitize_email($subscription['customer']['email']) : $email;
                 }
 
                 // If transaction doesn't have product but subscription does, inject product data from subscription
-                if (!isset($sale['product']) 
-                    && isset($subscription) && is_array($subscription) && !is_wp_error($subscription)
+                if (!isset($sale['product'])
+                    && is_array($subscription)
                     && isset($subscription['product']) && is_array($subscription['product'])) {
                     $sale['product'] = $subscription['product'];
                 }
 
-                // Reliable check: does a WP user with this email already have this exact sale_id recorded?
+                // Reliable check: has this exact sale_id already been processed for this
+                // user? We look at BOTH the single `creem_sale_id` (the latest sale) and a
+                // set of every sale_id ever processed (`creem_processed_sale_ids`). The
+                // set is what stops older renewals of the same subscription being
+                // re-processed on every cron run: only the latest sale matches
+                // creem_sale_id, so without the set the other renewals re-enter
+                // process_sale() forever (bloating creem_purchase_history and churning
+                // creem_last_purchase_date with old transactions).
                 $should_process = true;
                 if (!empty($email) && !empty($sale_id)) {
                     $existing_user = get_user_by('email', $email);
                     if ($existing_user) {
-                        $stored_sale_id = get_user_meta($existing_user->ID, 'creem_sale_id', true);
-                        if ($stored_sale_id === $sale_id) {
-                            $should_process = false; // Already processed, user exists
+                        $already_processed = ($sale_id === get_user_meta($existing_user->ID, 'creem_sale_id', true));
+                        if (!$already_processed) {
+                            $already_processed = in_array($sale_id, $this->get_processed_sale_ids($existing_user->ID), true);
+                        }
+                        if ($already_processed) {
+                            $should_process = false;
                         }
                     }
                 }
@@ -711,7 +965,39 @@ class Creem_API_WordPress {
                     $result = $this->process_sale($sale);
                     if (!is_wp_error($result)) {
                         $new_sales_count++;
+                        // Record this sale_id as processed so it is never re-processed on
+                        // future cron runs (idempotency set for renewals/older transactions).
+                        if (!empty($sale_id) && !empty($result)) {
+                            $this->add_processed_sale_id($result, $sale_id);
+                        }
+                        // Reset subscription status on a successful (re)payment so a
+                        // renew-then-expire cycle is caught again and the "Active
+                        // Subscriptions" metric stays correct. Subscription sales only.
+                        if (is_array($subscription) && !empty($result)) {
+                            $sub_status_now = isset($subscription['status']) ? $subscription['status'] : '';
+                            if ($sub_status_now !== '' && !in_array($sub_status_now, self::$ENDED_STATUSES, true)) {
+                                update_user_meta($result, 'creem_subscription_status', $sub_status_now);
+                                // A renewed subscription is no longer ending: clear the
+                                // end date/ends_at meta that handle_subscription_change
+                                // set on the prior cancellation so they don't stay stale.
+                                delete_user_meta($result, 'creem_subscription_ended_date');
+                                delete_user_meta($result, 'creem_subscription_ends_at');
+                            }
+                        }
                     }
+                }
+            }
+
+            // B1: warn (once per run) for customers holding 2+ concurrent active
+            // subscriptions. The plugin supports 1 active subscription per customer;
+            // concurrent subs are not fully reconciled, so flag them for manual review.
+            foreach ($active_subs_by_email as $em => $subs) {
+                if (is_array($subs) && count($subs) >= 2) {
+                    $this->log_activity('Multiple active subscriptions for customer', array(
+                        'email' => $em,
+                        'subscription_ids' => array_keys($subs),
+                        'note' => 'Plugin supports 1 active subscription per customer; review manually',
+                    ));
                 }
             }
 
@@ -719,7 +1005,8 @@ class Creem_API_WordPress {
                 'total_sales_checked' => count($transactions),
                 'new_sales_processed' => $new_sales_count,
                 'refunds_processed' => $refunds_processed,
-                'subscriptions_updated' => $subscriptions_updated
+                'subscriptions_updated' => $subscriptions_updated,
+                'one_time_skipped' => $one_time_skipped
             ));
         }
 
@@ -739,19 +1026,52 @@ class Creem_API_WordPress {
      * This catches subscription changes that may not appear in recent orders
      */
     private function check_existing_subscriptions($access_token) {
+        // Isolate this phase from the preceding transaction loop. The reconciler
+        // runs in the same request/instance right after check_recent_sales(); if
+        // we reused its cached subscription values, a cancellation happening in
+        // the milliseconds between the two phases would be masked (detected one
+        // cron interval later instead of now). Clearing here guarantees fresh
+        // data while still memoizing within this method (users sharing a
+        // subscription_id in the same batch still fetch only once).
+        $this->subscription_cache = array();
+
         if (empty($access_token)) {
             return 0;
         }
 
         $settings = get_option($this->option_name);
+        $product_roles = isset($settings['product_roles']) ? $settings['product_roles'] : array();
+        $default_roles = isset($settings['default_roles']) ? $settings['default_roles'] : array('subscriber');
 
-        // Get users with creem subscriptions who are still active (not marked as expired/past_due)
+        // Get users with creem subscriptions who have not already been processed as ended.
+        // creem_subscription_status is only written when access has been revoked, so any
+        // value present there means the user was already handled.
+        // Rotating batch so ALL eligible users are eventually checked, not just
+        // the first N by login on every cron run. The offset is persisted in an
+        // option and advanced each run; when we reach the tail of the result set
+        // it wraps back to 0. (Cleaned up on uninstall via the creem_% catch-all.)
+        $batch_size = 50; // Check 50 users per cron run to avoid timeouts
+        $offset = max(0, intval(get_option('creem_existing_subs_offset', 0)));
+
         $args = array(
             'meta_query' => array(
                 'relation' => 'AND',
                 array(
                     'key' => 'creem_sale_data',
                     'compare' => 'EXISTS'
+                ),
+                // Exclude users whose access was revoked by a refund (remove_roles
+                // path). The refund path removes the product roles WITHOUT writing
+                // creem_subscription_status, so without this clause a refunded user
+                // would still match the batch and, whenever the live Creem
+                // subscription is still 'active' (a refund of courtesy with no
+                // explicit cancellation), apply_expected_roles() would re-grant the
+                // roles on the next cron run — silently undoing the refund within
+                // one cycle. Mirrors the dashboard "Active Subscriptions" SQL which
+                // already excludes creem_refunded. (BUG 1)
+                array(
+                    'key' => 'creem_refunded',
+                    'compare' => 'NOT EXISTS'
                 ),
                 array(
                     'relation' => 'OR',
@@ -761,17 +1081,24 @@ class Creem_API_WordPress {
                     ),
                     array(
                         'key' => 'creem_subscription_status',
-                        'value' => array('expired', 'past_due'),
+                        'value' => self::$ENDED_STATUSES,
                         'compare' => 'NOT IN'
                     )
                 )
             ),
-            'number' => 50, // Check 50 users per cron run to avoid timeouts
+            'number' => $batch_size,
+            'offset' => $offset,
             'fields' => 'ids' // Only fetch user IDs for better performance
         );
 
         $user_query = new WP_User_Query($args);
         $user_ids = $user_query->get_results();
+        $returned = count($user_ids);
+
+        // Advance (and wrap) the offset for the next run. If we got back fewer
+        // than a full batch we've consumed the tail -> restart from the top.
+        update_option('creem_existing_subs_offset', ($returned < $batch_size) ? 0 : ($offset + $batch_size));
+
         $checked_count = 0;
 
         foreach ($user_ids as $user_id) {
@@ -787,7 +1114,7 @@ class Creem_API_WordPress {
             }
 
             // Extract subscription ID (pass access_token to fetch from links if needed)
-            $subscription_id = $this->extract_subscription_id($sale_data, $access_token);
+            $subscription_id = $this->extract_subscription_id($sale_data);
             if (empty($subscription_id)) {
                 continue; // Not a subscription purchase
             }
@@ -798,33 +1125,127 @@ class Creem_API_WordPress {
                 continue;
             }
 
-            // Creem.io uses flat JSON structure — no 'attributes' wrapper
+            // Creem.io REST returns a flat JSON object, not an "attributes" wrapper.
             $sub_status = isset($subscription['status']) ? $subscription['status'] : '';
             $ends_at = isset($subscription['current_period_end_date']) ? $subscription['current_period_end_date'] : '';
 
             $checked_count++;
 
-            // Check if subscription needs action
-            if (in_array($sub_status, array('expired', 'past_due'))) {
-                // Subscription has ended, remove roles
+            // Reconcile roles to the live subscription status. Idempotent + self-healing.
+            // Runs for non-ended subscriptions. Two live states are handled:
+            //   - active: expected = product roles (per-product mapping, else default_roles)
+            //   - paused: expected = default_roles (downgrade; reversed on resume)
+            // 'paused' is intentionally NOT in $ENDED_STATUSES, so paused users stay in
+            // this reconciliation batch and are restored automatically when they resume.
+            if (!in_array($sub_status, self::$ENDED_STATUSES, true)) {
+                $current_pid = isset($subscription['product']['id']) ? strval($subscription['product']['id']) : '';
+
+                // "Active entitlement": the roles the user should have when active
+                // (same derivation as process_sale: per-product mapping, else default_roles).
+                // Stored in creem_assigned_roles and restored on resume from a pause.
+                if (!empty($current_pid) && isset($product_roles[$current_pid]) && is_array($product_roles[$current_pid])) {
+                    $entitlement = array_values($product_roles[$current_pid]);
+                } else {
+                    $entitlement = !empty($default_roles) ? array_values($default_roles) : array();
+                }
+
+                // Roles to apply right now depend on the live status.
+                if ($sub_status === 'paused') {
+                    $expected = !empty($default_roles) ? array_values($default_roles) : array();
+                } else {
+                    $expected = $entitlement;
+                }
+
+                // Note (default-role coupling): on resume, apply_expected_roles()
+                // removes the default role(s) granted during the pause (they are in
+                // the managed universe below but not in the active entitlement). This
+                // is intended — the user returns to the product role(s) only. If your
+                // default_roles include a role a user must keep independently, configure
+                // per-product roles instead, or accept this resume behavior.
+                // Plugin-managed universe: entitlement (granted when active) plus
+                // default_roles (granted when paused / no mapping) PLUS every role
+                // configured under product_roles[] for ANY product PLUS the roles this
+                // user was actually granted (creem_assigned_roles). Only roles in this
+                // universe are ever removed, so non-plugin roles are never touched.
+                // Including all product roles is what lets the reconciler strip an ORPHAN
+                // role from a previous product after a silent downgrade. Including the
+                // user's own stored creem_assigned_roles is what closes the remaining gap
+                // of BUG 2: a role the admin removed from EVERY product config is no
+                // longer in all_configured_product_roles(), so without the stored set it
+                // would fall out of the managed universe and survive on the user forever
+                // (and creem_assigned_roles would then be overwritten below to the new
+                // entitlement, erasing the record that it was ever plugin-granted —
+                // making it unremovable even at subscription end). Mirrors
+                // handle_subscription_change(), whose $entitlement already comes from
+                // creem_assigned_roles. A role still legitimately expected is in
+                // $expected, so it is protected from removal. (BUG 2 completion)
+                $stored_assigned_raw = get_user_meta($user_id, 'creem_assigned_roles', true);
+                $stored_assigned = $stored_assigned_raw ? json_decode($stored_assigned_raw, true) : array();
+                $stored_assigned = is_array($stored_assigned) ? array_values($stored_assigned) : array();
+                $managed_union = array_values(array_unique(array_merge(
+                    $entitlement,
+                    $stored_assigned,
+                    $this->all_configured_product_roles($product_roles),
+                    is_array($default_roles) ? $default_roles : array()
+                )));
+
+                $changes = $this->apply_expected_roles($user_id, $expected, $managed_union);
+                $removed = $changes['removed'];
+                $added   = $changes['added'];
+
+                // Transition logging (once per state change) + status/product sync.
+                $previous_status = get_user_meta($user_id, 'creem_subscription_status', true);
+                $stored_pid = strval(get_user_meta($user_id, 'creem_product_id', true));
+                $status_changed = ($sub_status !== '' && $previous_status !== $sub_status);
+
+                if ($sub_status === 'paused' && $previous_status !== 'paused') {
+                    $this->log_activity('Subscription paused - downgraded to default role', array(
+                        'user_id' => $user_id,
+                        'product_id' => $current_pid,
+                        'roles_removed' => $removed,
+                        'roles_added' => $added,
+                    ));
+                } elseif ($sub_status !== 'paused' && $previous_status === 'paused') {
+                    $this->log_activity('Subscription resumed - roles restored', array(
+                        'user_id' => $user_id,
+                        'product_id' => $current_pid,
+                        'roles_removed' => $removed,
+                        'roles_added' => $added,
+                    ));
+                } elseif (!empty($removed) || !empty($added)) {
+                    $this->log_activity('Subscription roles reconciled (upgrade/downgrade)', array(
+                        'user_id' => $user_id,
+                        'product_id' => $current_pid,
+                        'roles_removed' => $removed,
+                        'roles_added' => $added,
+                        'roles' => $expected,
+                    ));
+                }
+
+                // creem_assigned_roles always reflects the ACTIVE entitlement (not the
+                // paused default) so remove_product_roles() and the resume path work.
+                if (!empty($removed) || !empty($added) || $stored_pid !== $current_pid || $status_changed) {
+                    update_user_meta($user_id, 'creem_product_id', $current_pid);
+                    update_user_meta($user_id, 'creem_product_name', isset($subscription['product']['name']) ? $subscription['product']['name'] : '');
+                    update_user_meta($user_id, 'creem_assigned_roles', json_encode($entitlement));
+                    if ($status_changed) {
+                        update_user_meta($user_id, 'creem_subscription_status', $sub_status);
+                    }
+                }
+            }
+
+            // Remove access only for ended statuses once the paid period is over.
+            if (in_array($sub_status, self::$ENDED_STATUSES, true)
+                && $this->creem_period_ended($ends_at)
+            ) {
                 $result = $this->handle_subscription_change($sale_data, $subscription);
                 if (!is_wp_error($result)) {
                     $user = get_userdata($user_id);
-                    $this->log_activity('Subscription auto-detected as ended', array(
+                    $this->log_activity('Subscription ended - roles removed', array(
                         'user_id' => $user_id,
                         'email' => $user ? $user->user_email : 'unknown',
                         'subscription_id' => $subscription_id,
-                        'status' => $sub_status
-                    ));
-                }
-            } else if ($sub_status === 'cancelled' && !empty($ends_at) && strtotime($ends_at) <= time()) {
-                // Cancelled subscription, grace period ended
-                $result = $this->handle_subscription_change($sale_data, $subscription);
-                if (!is_wp_error($result)) {
-                    $this->log_activity('Cancelled subscription grace period ended', array(
-                        'user_id' => $user->ID,
-                        'email' => $user->user_email,
-                        'subscription_id' => $subscription_id,
+                        'status' => $sub_status,
                         'ends_at' => $ends_at
                     ));
                 }
@@ -870,7 +1291,9 @@ class Creem_API_WordPress {
         if (empty($product_id)) {
             $this->log_activity('MISSING PRODUCT ID', array(
                 'email' => $email,
-                'raw_sale' => $sale_data
+                'sale_id' => isset($sale_data['id']) ? $sale_data['id'] : '',
+                'subscription_id' => $this->extract_subscription_id($sale_data),
+                'raw_sale' => $this->is_debug_mode() ? $sale_data : null
             ));
             return new WP_Error('missing_product_id', 'Product ID is missing');
         }
@@ -891,7 +1314,7 @@ class Creem_API_WordPress {
             ));
             return new WP_Error('auto_create_disabled', 'Auto create users not enabled for this product');
         }
-
+        
         // Check if user exists
         $user = get_user_by('email', $email);
 
@@ -900,7 +1323,7 @@ class Creem_API_WordPress {
 
         // Determine roles for this product
         $roles = array();
-        if (!empty($product_id) && isset($product_roles[$product_id]) && !empty($product_roles[$product_id])) {
+        if (!empty($product_id) && isset($product_roles[$product_id]) && is_array($product_roles[$product_id]) && !empty($product_roles[$product_id])) {
             $roles = $product_roles[$product_id];
         } else {
             $roles = $default_roles;
@@ -929,6 +1352,12 @@ class Creem_API_WordPress {
             }
 
             $user = get_user_by('id', $user_id);
+            if (!$user) {
+                // Extremely rare race: the account was removed between
+                // wp_create_user() and this lookup. Bail cleanly instead of
+                // fatal-ing on $user->set_role() under PHP 8. (M2)
+                return new WP_Error('user_not_found', 'User not found after creation');
+            }
 
             // Set first name from email
             $first_name = $this->get_first_name_from_email($email);
@@ -968,6 +1397,11 @@ class Creem_API_WordPress {
             $email_sent = false;
             if (isset($settings['send_welcome_email']) && $settings['send_welcome_email']) {
                 $email_sent = $this->send_welcome_email($user, $password, $product_name);
+            } else {
+                // Welcome email disabled: still guarantee the new user can log in
+                // by triggering WordPress' standard "set your password" notification,
+                // otherwise they would be left with an unreachable random password.
+                wp_new_user_notification($user_id, null, 'user');
             }
             
             update_user_meta($user_id, 'creem_email_sent', $email_sent ? 'yes' : 'no');
@@ -987,6 +1421,15 @@ class Creem_API_WordPress {
             
             return $user_id;
         } else {
+            // Upgrade/downgrade: remove the PREVIOUS product's roles before
+            // granting the new ones, so the change takes effect immediately
+            // instead of waiting for the reconciliation batch. No-op on a
+            // renewal of the same product (same product_id). (B8)
+            $old_pid = strval(get_user_meta($user->ID, 'creem_product_id', true));
+            if ($old_pid !== '' && $old_pid !== strval($product_id)) {
+                $this->remove_product_roles($user, $old_pid);
+            }
+
             // Update existing user roles if needed
             $roles_added = array();
             foreach ($roles as $role) {
@@ -995,42 +1438,93 @@ class Creem_API_WordPress {
                     $roles_added[] = $role;
                 }
             }
-            
-            if (!empty($roles_added)) {
-                // Update creem metadata for existing user
-                $sale_id = isset($sale_data['id']) ? $sale_data['id'] : '';
-                update_user_meta($user->ID, 'creem_last_purchase_date', current_time('mysql'));
-                update_user_meta($user->ID, 'creem_last_product_name', $product_name);
-                update_user_meta($user->ID, 'creem_last_product_id', $product_id);
-                update_user_meta($user->ID, 'creem_last_sale_id', $sale_id);
-                
-                // Append to purchase history
-                $purchase_history = get_user_meta($user->ID, 'creem_purchase_history', true);
-                if (!$purchase_history) {
-                    $purchase_history = array();
-                } else {
-                    $purchase_history = json_decode($purchase_history, true);
-                }
-                $purchase_history[] = array(
-                    'date' => current_time('mysql'),
-                    'product_name' => $product_name,
-                    'product_id' => $product_id,
-                    'sale_id' => $sale_id,
-                    'roles_added' => $roles_added
-                );
-                update_user_meta($user->ID, 'creem_purchase_history', json_encode($purchase_history));
-                
-                $this->log_activity('User roles updated', array(
+
+            // Record THIS sale regardless of whether new roles were added. A
+            // renewal that finds the roles already present must still update
+            // creem_sale_id; otherwise the idempotency check (which compares the
+            // stored sale_id against the current transaction) keeps re-processing
+            // the same renewal on every single cron run. Done OUTSIDE the
+            // roles_added block on purpose.
+            $sale_id = isset($sale_data['id']) ? $sale_data['id'] : '';
+            update_user_meta($user->ID, 'creem_sale_id', $sale_id);
+            update_user_meta($user->ID, 'creem_last_purchase_date', current_time('mysql'));
+            update_user_meta($user->ID, 'creem_last_product_name', $product_name);
+            update_user_meta($user->ID, 'creem_last_product_id', $product_id);
+            update_user_meta($user->ID, 'creem_last_sale_id', $sale_id);
+            // Keep the primary product meta in sync with the sale being
+            // processed (upgrade/downgrade) so the Users page and the Product
+            // Breakdown reflect the current product immediately, instead of
+            // waiting for the next reconciliation cycle.
+            update_user_meta($user->ID, 'creem_product_name', $product_name);
+            update_user_meta($user->ID, 'creem_product_id', $product_id);
+            // Keep creem_assigned_roles in sync with the roles just granted, so a
+            // later refund/cancel (remove_product_roles fallback) targets the CURRENT
+            // product's roles and not a stale set from the previous product. Mirrors
+            // the new-user branch. (Review fix: refund-after-upgrade access leak.)
+            update_user_meta($user->ID, 'creem_assigned_roles', json_encode($roles));
+            // Keep the stored sale data current so check_existing_subscriptions
+            // reconciles against the latest transaction. The subscription_id is
+            // stable across renewals, so this is safe.
+            update_user_meta($user->ID, 'creem_sale_data', json_encode($sale_data));
+
+            // Clear any STALE refund flag from a previous sale. The reconciler
+            // (check_existing_subscriptions) excludes users carrying creem_refunded
+            // (the BUG 1 fix), which is correct right after a refund — but once the
+            // customer legitimately re-purchases, the flag refers to an OLDER sale_id
+            // and must be cleared, otherwise the user is permanently excluded from
+            // reconciliation: a later pause/downgrade of the NEW subscription would
+            // never be applied (the customer would keep the product roles during the
+            // pause instead of being downgraded to default_roles), and admin
+            // product_roles reconfigurations would not be reconciled either. Mirrors
+            // the cron post-process block that clears the end-date meta on renewal.
+            // (BUG 3)
+            $stale_refunded_sale = get_user_meta($user->ID, 'creem_refunded', true);
+            if (!empty($stale_refunded_sale) && $stale_refunded_sale !== $sale_id) {
+                delete_user_meta($user->ID, 'creem_refunded');
+                delete_user_meta($user->ID, 'creem_refunded_date');
+                $this->log_activity('Refund flag cleared on re-purchase', array(
                     'user_id' => $user->ID,
                     'email' => $email,
-                    'username' => $user->user_login,
-                    'product_name' => $product_name,
-                    'product_id' => $product_id,
-                    'sale_id' => $sale_id,
-                    'roles_added' => $roles_added,
-                    'all_roles' => $user->roles
+                    'stale_refunded_sale_id' => $stale_refunded_sale,
+                    'new_sale_id' => $sale_id,
                 ));
             }
+
+            // Append to purchase history
+            $purchase_history = get_user_meta($user->ID, 'creem_purchase_history', true);
+            if (!$purchase_history) {
+                $purchase_history = array();
+            } else {
+                $purchase_history = json_decode($purchase_history, true);
+            }
+            if (!is_array($purchase_history)) {
+                $purchase_history = array();
+            }
+            $purchase_history[] = array(
+                'date' => current_time('mysql'),
+                'product_name' => $product_name,
+                'product_id' => $product_id,
+                'sale_id' => $sale_id,
+                'roles_added' => $roles_added
+            );
+            // Cap the history so it cannot grow without bound even across many
+            // legitimate renewals. Keep the most recent entries (end of the array).
+            $history_cap = 100;
+            if (count($purchase_history) > $history_cap) {
+                $purchase_history = array_slice($purchase_history, -$history_cap);
+            }
+            update_user_meta($user->ID, 'creem_purchase_history', json_encode($purchase_history));
+
+            $this->log_activity(!empty($roles_added) ? 'User roles updated' : 'Renewal recorded', array(
+                'user_id' => $user->ID,
+                'email' => $email,
+                'username' => $user->user_login,
+                'product_name' => $product_name,
+                'product_id' => $product_id,
+                'sale_id' => $sale_id,
+                'roles_added' => $roles_added,
+                'all_roles' => $user->roles
+            ));
             
             return $user->ID;
         }
@@ -1061,7 +1555,10 @@ class Creem_API_WordPress {
      * Takes the part before @ and capitalizes it
      */
     private function get_first_name_from_email($email) {
-        $local_part = substr($email, 0, strpos($email, '@'));
+        $at_pos = strpos($email, '@');
+        // Guard: without '@' strpos returns false, which is invalid as a substr
+        // length and raises a deprecation in PHP 8. Fall back to the whole email.
+        $local_part = ($at_pos === false) ? $email : substr($email, 0, $at_pos);
 
         // Remove dots, underscores, and numbers to clean it up
         $clean_name = str_replace(array('.', '_', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'), ' ', $local_part);
@@ -1088,7 +1585,16 @@ class Creem_API_WordPress {
         $email_subject = isset($settings['email_subject']) ? $settings['email_subject'] : 'Welcome to {{site_name}}!';
         
         $reset_key = get_password_reset_key($user);
-        $password_reset_url = network_site_url("wp-login.php?action=rp&key=$reset_key&login=" . rawurlencode($user->user_login), 'login');
+        // get_password_reset_key() can return WP_Error (rare, e.g. the user has no
+        // usable reset capability). Interpolating a WP_Error into the URL below would
+        // raise a fatal "Object of class WP_Error could not be converted to string"
+        // under PHP 8 while building the welcome email. Fall back to the lost-password
+        // flow so the customer can still set a password.
+        if (is_wp_error($reset_key)) {
+            $password_reset_url = wp_lostpassword_url();
+        } else {
+            $password_reset_url = network_site_url("wp-login.php?action=rp&key=$reset_key&login=" . rawurlencode($user->user_login), 'login');
+        }
         
         // Dynamic tags
         $tags = array(
@@ -1120,18 +1626,17 @@ class Creem_API_WordPress {
 
 <p>Thank you for purchasing <strong>{{product_name}}</strong>! Your account has been created automatically.</p>
 
-<h3>Your Login Credentials:</h3>
+<h3>Your Account Login:</h3>
 
 <p><strong>Username:</strong> {{username}}<br>
-<strong>Password:</strong> {{password}}<br>
 <strong>Email:</strong> {{email}}</p>
 
-<p><a href="{{login_url}}">Login to Your Account</a></p>
+<p>For security, your password is not included in this email. Set it now:<br>
+<a href="{{password_reset_url}}">Set Your Password</a></p>
 
-<p>If you prefer to reset your password, use this link:<br>
-<a href="{{password_reset_url}}">Reset Password</a></p>
+<p><a href="{{login_url}}">Login to Your Account</a> (after setting your password)</p>
 
-<p><strong>Important:</strong> Please keep this email safe as it contains your login credentials.</p>
+<p><strong>Important:</strong> Use the "Set Your Password" link to choose your own password. The link expires after 24 hours; if it has expired, use the "Lost your password?" option on the login page.</p>
 
 <br>
 <p>{{site_name}} - <a href="{{site_url}}">{{site_url}}</a></p>';
@@ -1142,6 +1647,12 @@ class Creem_API_WordPress {
      */
     private function log_activity($type, $data) {
         $logs = get_option($this->log_option_name, array());
+        // Defensive: a corrupted/migrated option could store a non-array value,
+        // which would make array_unshift() and array_filter() below fail and break
+        // all logging. Reset to an empty array in that case.
+        if (!is_array($logs)) {
+            $logs = array();
+        }
         $settings = get_option($this->option_name);
         $log_limit = isset($settings['log_limit']) ? intval($settings['log_limit']) : 500;
         $log_rotation_days = isset($settings['log_rotation_days']) ? intval($settings['log_rotation_days']) : 30;
@@ -1165,31 +1676,218 @@ class Creem_API_WordPress {
             $logs = array_slice($logs, 0, $log_limit);
         }
         
-        update_option($this->log_option_name, array_values($logs));
+        $logs = array_values($logs);
+        // The log option can grow large (it stores API activity) and must NOT be
+        // autoloaded on every page load across the whole site. The first write
+        // creates it with autoload=no; subsequent update_option() calls preserve it.
+        if (get_option($this->log_option_name, null) === null) {
+            add_option($this->log_option_name, $logs, '', 'no');
+        } else {
+            update_option($this->log_option_name, $logs);
+        }
     }
-    
+
+    /**
+     * Whether full raw API payloads should be logged. Off by default to keep the
+     * activity log compact; enable in Settings > Log Settings while troubleshooting.
+     */
+    private function is_debug_mode() {
+        $settings = get_option($this->option_name);
+        return isset($settings['debug_mode']) && $settings['debug_mode'];
+    }
+
+    /**
+     * Ensure the creem_api_logs option is never autoloaded. Existing installs created
+     * it with autoload=yes (the update_option default); this flips it once. Runs on
+     * admin_init (NOT activation: WordPress does not run activation hooks during
+     * auto-updates) and is safe to run repeatedly.
+     */
+    public function ensure_logs_not_autoloaded() {
+        global $wpdb;
+        $autoload = $wpdb->get_var($wpdb->prepare(
+            "SELECT autoload FROM {$wpdb->options} WHERE option_name = %s",
+            $this->log_option_name
+        ));
+        if ($autoload === 'yes') {
+            $wpdb->update(
+                $wpdb->options,
+                array('autoload' => 'no'),
+                array('option_name' => $this->log_option_name),
+                array('%s'),
+                array('%s')
+            );
+        }
+    }
+
+    /**
+     * Read the activity-log option as a guaranteed array.
+     *
+     * Every write path (log_activity(), clear_logs()) stores an array, so under
+     * normal operation the option is always an array. However a corrupted or
+     * migrated option could hold a non-array value, which would make the read
+     * paths fatal on PHP 8 (array_slice() / foreach on a non-array is a
+     * TypeError). This mirrors the write-side guard already in log_activity()
+     * on the read side, in one place.
+     *
+     * Do NOT use this helper where the distinction between "option absent" and
+     * "option present" matters: log_activity() relies on
+     * get_option($this->log_option_name, null) === null to create the option
+     * with autoload=no on the first write. Returning array() here would break
+     * that, so this helper must never replace that specific call.
+     *
+     * @return array
+     */
+    private function get_logs() {
+        $logs = get_option($this->log_option_name, array());
+        return is_array($logs) ? $logs : array();
+    }
+
+    /**
+     * Get the set of sale_ids already processed for a user. Used for renewal
+     * idempotency (see check_recent_sales): only the latest sale_id is stored in
+     * creem_sale_id, so without this set older renewals are re-processed forever.
+     *
+     * @param int $user_id
+     * @return string[]
+     */
+    private function get_processed_sale_ids($user_id) {
+        $raw = get_user_meta($user_id, 'creem_processed_sale_ids', true);
+        $ids = $raw ? json_decode($raw, true) : array();
+        return is_array($ids) ? $ids : array();
+    }
+
+    /**
+     * Record a processed sale_id for a user, keeping the set capped (FIFO) so the
+     * meta cannot grow without bound. Idempotent: duplicate ids are not re-added.
+     *
+     * @param int $user_id
+     * @param string $sale_id
+     */
+    private function add_processed_sale_id($user_id, $sale_id) {
+        if (empty($sale_id)) {
+            return;
+        }
+        $ids = $this->get_processed_sale_ids($user_id);
+        if (in_array($sale_id, $ids, true)) {
+            return;
+        }
+        $ids[] = $sale_id;
+        $cap = 200;
+        if (count($ids) > $cap) {
+            $ids = array_slice($ids, -$cap);
+        }
+        update_user_meta($user_id, 'creem_processed_sale_ids', json_encode(array_values($ids)));
+    }
+
+    /**
+     * Global idempotency set of sale IDs already processed as a refund. Lives in
+     * wp_options (NOT user meta) so it survives account deletion: once a refunded
+     * sale has been handled (roles removed OR account deleted), it is never
+     * re-attempted, which stops the recurring "User not found" log entries that
+     * would otherwise fire on every cron run while the transaction stays in the
+     * fetch window. (B3)
+     */
+    private function get_processed_refund_sale_ids() {
+        $raw = get_option('creem_processed_refund_sale_ids', array());
+        if (!is_array($raw)) {
+            $raw = is_string($raw) ? json_decode($raw, true) : array();
+        }
+        return is_array($raw) ? $raw : array();
+    }
+
+    private function add_processed_refund_sale_id($sale_id) {
+        if (empty($sale_id)) {
+            return;
+        }
+        $ids = $this->get_processed_refund_sale_ids();
+        if (in_array($sale_id, $ids, true)) {
+            return;
+        }
+        $ids[] = $sale_id;
+        $cap = 1000;
+        if (count($ids) > $cap) {
+            $ids = array_slice($ids, -$cap);
+        }
+        update_option('creem_processed_refund_sale_ids', array_values($ids));
+    }
+
+    /**
+     * Global idempotency set of sale IDs already processed as a subscription end
+     * (cancellation/expiry). Lives in wp_options (NOT user meta) so it survives
+     * account deletion: once an ended subscription's transaction has been handled
+     * (roles removed OR account deleted), it is never re-attempted, which stops the
+     * recurring "Subscription change processing skipped: User not found" log entries
+     * that would otherwise fire on every cron run while the transaction stays in the
+     * fetch window. Mirrors the refund set (B3) for the subscription-end path, which
+     * was previously protected only by a per-user meta guard (useless once the account
+     * is deleted, e.g. subscription_cancellation_action=delete_account).
+     *
+     * Keyed by sale_id (NOT subscription_id): subscription_id is stable across
+     * renewals, so keying on it would permanently block the legitimate
+     * end -> renew -> end cycle. Each end event is a distinct transaction (sale_id),
+     * so a renewed subscription that ends again is still handled.
+     */
+    private function get_processed_sub_end_sale_ids() {
+        $raw = get_option('creem_processed_sub_end_sale_ids', array());
+        if (!is_array($raw)) {
+            $raw = is_string($raw) ? json_decode($raw, true) : array();
+        }
+        return is_array($raw) ? $raw : array();
+    }
+
+    private function add_processed_sub_end_sale_id($sale_id) {
+        if (empty($sale_id)) {
+            return;
+        }
+        $ids = $this->get_processed_sub_end_sale_ids();
+        if (in_array($sale_id, $ids, true)) {
+            return;
+        }
+        $ids[] = $sale_id;
+        $cap = 1000;
+        if (count($ids) > $cap) {
+            $ids = array_slice($ids, -$cap);
+        }
+        update_option('creem_processed_sub_end_sale_ids', array_values($ids));
+    }
+
     /**
      * Handle refund
      */
-    private function handle_refund($sale_data) {
+    private function handle_refund($sale_data, $subscription = null) {
         $settings = get_option($this->option_name);
 
         // Creem.io simple JSON structure
         $sale_id = isset($sale_data['id']) ? $sale_data['id'] : '';
-        
+
+        // Global idempotency: skip refunds already processed. Unlike the per-user
+        // creem_refunded check below, this one also covers the post-deletion case
+        // (user + meta gone), so we don't log "User not found" on every cron run.
+        if (!empty($sale_id) && in_array($sale_id, $this->get_processed_refund_sale_ids(), true)) {
+            return new WP_Error('already_processed', 'Refund already processed');
+        }
+
+        // The REST transaction "customer" is a string ID or empty; the reliable email
+        // source is the subscription object passed in from check_recent_sales.
         $email = '';
         if (isset($sale_data['customer'])) {
             if (is_array($sale_data['customer']) && isset($sale_data['customer']['email'])) {
                 $email = sanitize_email($sale_data['customer']['email']);
             }
         }
-        
+        if (empty($email) && is_array($subscription) && isset($subscription['customer']['email'])) {
+            $email = sanitize_email($subscription['customer']['email']);
+        }
+
         $product_name = '';
         if (isset($sale_data['product']) && is_array($sale_data['product'])) {
             $product_name = isset($sale_data['product']['name']) ? sanitize_text_field($sale_data['product']['name']) : '';
+        } elseif (is_array($subscription) && isset($subscription['product']['name'])) {
+            $product_name = sanitize_text_field($subscription['product']['name']);
         }
-        
+
         $refunded_amount = isset($sale_data['refunded_amount']) ? $sale_data['refunded_amount'] : 0;
+        $refunded_at = current_time('mysql');
 
         if (empty($email)) {
             return new WP_Error('invalid_email', 'Email address is required');
@@ -1197,12 +1895,31 @@ class Creem_API_WordPress {
 
         $user = get_user_by('email', $email);
         if (!$user) {
+            // The account is gone (deleted by a refund with delete_account, by a prior
+            // subscription-end run, or by an external process). There is nothing to do,
+            // so record this sale_id to stop re-attempting it (and logging "User not
+            // found") on every subsequent cron run. Mirrors handle_subscription_change()
+            // (which already records in its user_not_found branch); this branch was the
+            // only early-return of handle_refund() that skipped the global idempotency
+            // record at the bottom, so it spammed the log every cron run while the
+            // refunded transaction stayed in the fetch window. Same trade-off as the
+            // sub-end path: a genuinely deleted account is the terminal state.
+            $this->add_processed_refund_sale_id($sale_id);
             $this->log_activity('Refund processing skipped', array(
                 'reason' => 'User not found',
                 'email' => $email,
                 'sale_id' => $sale_id
             ));
             return new WP_Error('user_not_found', 'User not found');
+        }
+
+        // Idempotency guard (per-sale): skip if THIS sale was already processed as a
+        // refund, so it isn't re-logged / re-removed on every cron run. Tracked by
+        // sale_id (not a sticky 'yes') so a refund -> repurchase -> refund cycle still
+        // processes the new refund. (delete_account path: user+meta are gone, so this
+        // only covers remove_roles.)
+        if ($sale_id && get_user_meta($user->ID, 'creem_refunded', true) === $sale_id) {
+            return new WP_Error('already_processed', 'Refund already processed');
         }
 
         $refund_action = isset($settings['refund_action']) ? $settings['refund_action'] : 'remove_roles';
@@ -1216,23 +1933,38 @@ class Creem_API_WordPress {
                 'email' => $email,
                 'sale_id' => $sale_id,
                 'product' => $product_name,
-                'refunded_at' => current_time('mysql')
+                'refunded_at' => $refunded_at
             ));
         } else {
-            // Remove roles assigned by creem
-            $assigned_roles = get_user_meta($user->ID, 'creem_assigned_roles', true);
-            $roles_removed = array();
-            if ($assigned_roles) {
-                $roles = json_decode($assigned_roles, true);
-                if (is_array($roles)) {
-                    foreach ($roles as $role) {
-                        $user->remove_role($role);
-                        $roles_removed[] = $role;
-                    }
-                }
-            }
+            // Converge the user to ZERO plugin-managed roles (active entitlement ∪
+            // default_roles ∪ all configured product roles), not just the refunded
+            // product's roles. This mirrors handle_subscription_change()'s remove_roles
+            // branch (which uses apply_expected_roles for the same "user lost access"
+            // concept). The old remove_product_roles() call was product-aware and fell
+            // back to creem_assigned_roles, which stores the ACTIVE entitlement (not the
+            // roles the user currently holds) — so refunding a PAUSED user (who holds
+            // default_roles, not the product roles) removed nothing and leaked the
+            // default_roles forever (the reconciler then excluded them via creem_refunded
+            // NOT EXISTS, so the leak was silent and permanent). Converging over the full
+            // managed universe removes both the product roles AND the default_roles held
+            // during a pause, so active->refunded and paused->refunded behave identically
+            // (matching active->canceled / paused->canceled). creem_assigned_roles is
+            // intentionally left untouched, like handle_subscription_change(). Non-plugin
+            // roles are never touched (they are outside managed_union).
+            $assigned = json_decode(get_user_meta($user->ID, 'creem_assigned_roles', true), true);
+            $entitlement = is_array($assigned) ? array_values($assigned) : array();
+            $default_roles = isset($settings['default_roles']) && is_array($settings['default_roles']) ? array_values($settings['default_roles']) : array();
+            $product_roles_here = isset($settings['product_roles']) && is_array($settings['product_roles']) ? $settings['product_roles'] : array();
+            $managed_union = array_values(array_unique(array_merge(
+                $entitlement,
+                $this->all_configured_product_roles($product_roles_here),
+                $default_roles
+            )));
 
-            update_user_meta($user->ID, 'creem_refunded', 'yes');
+            $changes = $this->apply_expected_roles($user->ID, array(), $managed_union);
+            $roles_removed = $changes['removed'];
+
+            update_user_meta($user->ID, 'creem_refunded', $sale_id);
             update_user_meta($user->ID, 'creem_refunded_date', current_time('mysql'));
 
             $this->log_activity('User roles removed due to refund', array(
@@ -1240,14 +1972,148 @@ class Creem_API_WordPress {
                 'email' => $email,
                 'sale_id' => $sale_id,
                 'product' => $product_name,
-                'refunded_at' => current_time('mysql'),
+                'refunded_at' => $refunded_at,
                 'roles_removed' => $roles_removed
             ));
         }
 
+        // Persistent all-time refund counter for the dashboard. Reaching here
+        // means the idempotency guard above did NOT short-circuit, so this is a
+        // genuinely new refund. (Cleaned up on uninstall via the creem_% catch-all.)
+        $refund_count = intval(get_option('creem_refund_count', 0));
+        update_option('creem_refund_count', $refund_count + 1);
+
+        // Record in the global set so this refund is never re-attempted (covers
+        // the account-deletion path where per-user creem_refunded is gone). (B3)
+        $this->add_processed_refund_sale_id($sale_id);
+
         return $user->ID;
     }
-    
+
+    /**
+     * Remove the roles belonging to a given product from a user (product-aware).
+     *
+     * Uses the configured product_roles[product_id] mapping when available, otherwise
+     * falls back to the stored creem_assigned_roles meta. Only roles the user actually
+     * holds are removed. The creem_assigned_roles meta is intentionally left untouched:
+     * it stays as the "should-have" list that the renewal redirect relies on to detect
+     * revoked users. Returns the list of removed role keys.
+     */
+    private function remove_product_roles($user, $product_id = '') {
+        if (!$user) {
+            return array();
+        }
+
+        $settings = get_option($this->option_name);
+        $product_roles = isset($settings['product_roles']) ? $settings['product_roles'] : array();
+
+        $target_roles = array();
+        if (!empty($product_id) && isset($product_roles[$product_id]) && is_array($product_roles[$product_id])) {
+            $target_roles = array_values($product_roles[$product_id]);
+        }
+
+        if (empty($target_roles)) {
+            $assigned = get_user_meta($user->ID, 'creem_assigned_roles', true);
+            $decoded = $assigned ? json_decode($assigned, true) : null;
+            if (is_array($decoded)) {
+                $target_roles = array_values($decoded);
+            }
+        }
+
+        if (empty($target_roles)) {
+            return array();
+        }
+
+        $user_roles = (array) $user->roles;
+        $roles_removed = array();
+        foreach ($target_roles as $role) {
+            if (in_array($role, $user_roles, true)) {
+                $user->remove_role($role);
+                $roles_removed[] = $role;
+            }
+        }
+
+        return $roles_removed;
+    }
+
+    /**
+     * Flatten every role configured under product_roles[] (across ALL products)
+     * into a single deduped list of non-empty strings.
+     *
+     * Used to build the plugin-managed universe in the reconciler and in the
+     * subscription-end path. A role that the plugin could have granted for ANY
+     * product must be removable when it is no longer expected, otherwise a user
+     * who downgraded silently (no new transaction: e.g. a subscription.update
+     * product change on Creem without a charge, or the admin reconfigured the
+     * product_roles mapping afterwards) keeps the previous product's role
+     * forever, because managed_union would otherwise only cover the CURRENT
+     * product's roles + default_roles. (BUG 2)
+     *
+     * @param array $product_roles
+     * @return string[]
+     */
+    private function all_configured_product_roles($product_roles) {
+        $out = array();
+        if (is_array($product_roles)) {
+            foreach ($product_roles as $roles) {
+                if (is_array($roles)) {
+                    foreach ($roles as $r) {
+                        if (is_string($r) && $r !== '') {
+                            $out[] = $r;
+                        }
+                    }
+                }
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Converge a user's roles to exactly $expected, but only ever touching roles
+     * that belong to $managed (the plugin-managed universe = active entitlement
+     * ∪ default_roles). Any role the user holds that is in $managed but not in
+     * $expected is removed; any role in $expected that is missing is added.
+     * Roles not managed by the plugin are never touched.
+     *
+     * This is what makes the paused/active transition reversible without
+     * flip-flopping: every reconciliation run converges to the same result, so
+     * a paused user lands on the default roles and an active (resumed) user
+     * lands back on the product roles. (B11)
+     *
+     * @param int $user_id
+     * @param string[] $expected Roles that should be present now.
+     * @param string[] $managed  Roles the plugin may add/remove (everything else is left alone).
+     * @return array{removed:string[],added:string[]}
+     */
+    private function apply_expected_roles($user_id, $expected, $managed) {
+        $removed = array();
+        $added = array();
+
+        $ru = get_userdata($user_id);
+        if (!$ru) {
+            return array('removed' => $removed, 'added' => $added);
+        }
+
+        $expected = is_array($expected) ? array_values($expected) : array();
+        $managed = is_array($managed) ? array_values($managed) : array();
+        $u_roles = (array) $ru->roles;
+
+        foreach ($managed as $r) {
+            if (!in_array($r, $expected, true) && in_array($r, $u_roles, true)) {
+                $ru->remove_role($r);
+                $removed[] = $r;
+            }
+        }
+        foreach ($expected as $r) {
+            if (!in_array($r, $u_roles, true)) {
+                $ru->add_role($r);
+                $added[] = $r;
+            }
+        }
+
+        return array('removed' => $removed, 'added' => $added);
+    }
+
     /**
      * Handle subscription change (cancellation/end/expiration)
      *
@@ -1257,6 +2123,17 @@ class Creem_API_WordPress {
     private function handle_subscription_change($transaction_data, $subscription_data) {
         $settings = get_option($this->option_name);
 
+        $sale_id = isset($transaction_data['id']) ? $transaction_data['id'] : '';
+
+        // Global idempotency: skip subscription ends already processed. Mirrors the
+        // refund set (B3) and, crucially, covers the post-deletion case (user + meta
+        // gone), so we don't log "Subscription change processing skipped: User not
+        // found" on every cron run while the transaction stays in the fetch window.
+        // Keyed by sale_id so the legitimate end -> renew -> end cycle is never blocked.
+        if (!empty($sale_id) && in_array($sale_id, $this->get_processed_sub_end_sale_ids(), true)) {
+            return new WP_Error('already_processed', 'Subscription end already processed');
+        }
+
         // Extract from transaction (Creem.io simple JSON)
         $email = '';
         $product_name = '';
@@ -1264,7 +2141,14 @@ class Creem_API_WordPress {
         if (isset($transaction_data['customer']) && is_array($transaction_data['customer'])) {
             $email = isset($transaction_data['customer']['email']) ? sanitize_email($transaction_data['customer']['email']) : '';
         }
-        
+
+        // In Creem REST responses the transaction "customer" is a string ID (or empty),
+        // never an object with an email. The reliable email source is the subscription
+        // object, where "customer" is an object with id/email/name.
+        if (empty($email) && isset($subscription_data['customer']['email'])) {
+            $email = sanitize_email($subscription_data['customer']['email']);
+        }
+
         if (isset($transaction_data['product']) && is_array($transaction_data['product'])) {
             $product_name = isset($transaction_data['product']['name']) ? sanitize_text_field($transaction_data['product']['name']) : '';
         }
@@ -1275,12 +2159,21 @@ class Creem_API_WordPress {
         $current_period_end = isset($subscription_data['current_period_end_date']) ? $subscription_data['current_period_end_date'] : '';
         $canceled_at = isset($subscription_data['canceled_at']) ? $subscription_data['canceled_at'] : '';
 
+        // Used in the activity logs below; keep them in sync with the data we have.
+        $ends_at = $current_period_end;
+        $cancelled = in_array($sub_status, self::$ENDED_STATUSES, true);
+
         if (empty($email)) {
             return new WP_Error('invalid_email', 'Email address is required');
         }
 
         $user = get_user_by('email', $email);
         if (!$user) {
+            // The account is gone (deleted by a refund with delete_account, by a prior
+            // subscription-end run, or by an external process). There is nothing to do,
+            // so record this sale_id to stop re-attempting it (and logging "User not
+            // found") on every subsequent cron run.
+            $this->add_processed_sub_end_sale_id($sale_id);
             $this->log_activity('Subscription change processing skipped', array(
                 'reason' => 'User not found',
                 'email' => $email,
@@ -1288,6 +2181,14 @@ class Creem_API_WordPress {
                 'subscription_status' => $sub_status
             ));
             return new WP_Error('user_not_found', 'User not found');
+        }
+
+        // Idempotency guard: skip if this subscription was already processed as ended,
+        // so roles aren't re-removed / dates re-stamped / logs re-written every cron.
+        // A renewal is a NEW transaction handled by process_sale, so this never blocks
+        // legitimate re-activation.
+        if (in_array(get_user_meta($user->ID, 'creem_subscription_status', true), self::$ENDED_STATUSES, true)) {
+            return new WP_Error('already_processed', 'Subscription already processed as ended');
         }
 
         $action = isset($settings['subscription_cancellation_action']) ? $settings['subscription_cancellation_action'] : 'remove_roles';
@@ -1302,27 +2203,38 @@ class Creem_API_WordPress {
                 'subscription_id' => $subscription_id,
                 'subscription_status' => $sub_status,
                 'product' => $product_name,
-                'ends_at' => $current_period_end
+                'ends_at' => $ends_at
             ));
         } else {
-            // Remove roles assigned by creem
-            $assigned_roles = get_user_meta($user->ID, 'creem_assigned_roles', true);
-            $roles_removed = array();
-            if ($assigned_roles) {
-                $roles = json_decode($assigned_roles, true);
-                if (is_array($roles)) {
-                    foreach ($roles as $role) {
-                        $user->remove_role($role);
-                        $roles_removed[] = $role;
-                    }
-                }
-            }
+            // Converge the user to ZERO plugin-managed roles (active entitlement ∪
+            // default_roles), not just the product roles. This fixes an access leak
+            // on the paused -> canceled path: a paused user holds the default_roles
+            // (granted by apply_expected_roles during the pause), so removing only
+            // the product roles left the default_roles in place after cancellation.
+            // Converging over the full managed universe removes both, so
+            // active->canceled and paused->canceled behave identically. Non-plugin
+            // roles are never touched.
+            $assigned = json_decode(get_user_meta($user->ID, 'creem_assigned_roles', true), true);
+            $entitlement = is_array($assigned) ? array_values($assigned) : array();
+            $default_roles = isset($settings['default_roles']) && is_array($settings['default_roles']) ? array_values($settings['default_roles']) : array();
+            // managed_union must span ALL configured product roles (not just the
+            // current product's entitlement) so an orphan role from a PREVIOUS
+            // product is stripped on cancellation too. Mirrors the reconciler. (BUG 2)
+            $product_roles_here = isset($settings['product_roles']) && is_array($settings['product_roles']) ? $settings['product_roles'] : array();
+            $managed_union = array_values(array_unique(array_merge(
+                $entitlement,
+                $this->all_configured_product_roles($product_roles_here),
+                $default_roles
+            )));
+
+            $changes = $this->apply_expected_roles($user->ID, array(), $managed_union);
+            $roles_removed = $changes['removed'];
 
             // Update subscription status in user meta
             update_user_meta($user->ID, 'creem_subscription_status', $sub_status);
             update_user_meta($user->ID, 'creem_subscription_ended_date', current_time('mysql'));
-            if (!empty($current_period_end)) {
-                update_user_meta($user->ID, 'creem_subscription_ends_at', $current_period_end);
+            if (!empty($ends_at)) {
+                update_user_meta($user->ID, 'creem_subscription_ends_at', $ends_at);
             }
 
             $this->log_activity('Subscription ended - roles removed', array(
@@ -1333,10 +2245,14 @@ class Creem_API_WordPress {
                 'product' => $product_name,
                 'action' => $action,
                 'roles_removed' => $roles_removed,
-                'ends_at' => $current_period_end,
-                'canceled_at' => $canceled_at
+                'ends_at' => $ends_at,
+                'canceled' => $cancelled
             ));
         }
+
+        // Record this end so it is never re-attempted (covers the delete_account path
+        // where the per-user idempotency meta is gone). Mirrors the refund set (B3).
+        $this->add_processed_sub_end_sale_id($sale_id);
 
         return $user->ID;
     }
@@ -1354,9 +2270,9 @@ class Creem_API_WordPress {
             <!-- Statistics Grid -->
             <div class="snn-creem-stats-grid">
                 
-                <!-- Total Sales Processed -->
+                <!-- Customers Created -->
                 <div class="snn-creem-stat-card">
-                    <div class="snn-creem-stat-card-header"><?php _e('Total Sales Processed', 'snn'); ?></div>
+                    <div class="snn-creem-stat-card-header"><?php _e('Customers Created', 'snn'); ?></div>
                     <div class="snn-creem-stat-card-value"><?php echo number_format($stats['total_sales']); ?></div>
                     <div class="snn-creem-stat-card-footer"><?php _e('All time', 'snn'); ?></div>
                 </div>
@@ -1412,9 +2328,6 @@ class Creem_API_WordPress {
                 
             </div>
             
-            <!-- Recent Logs + Product Breakdown side by side -->
-            <div class="snn-creem-dashboard-sections">
-            
             <!-- Recent Logs Preview -->
             <div class="snn-creem-section">
                 <div class="snn-creem-recent-logs-header">
@@ -1423,7 +2336,7 @@ class Creem_API_WordPress {
                 </div>
                 
                 <?php
-                $recent_logs = array_slice(get_option($this->log_option_name, array()), 0, 5);
+                $recent_logs = array_slice($this->get_logs(), 0, 5);
                 if (empty($recent_logs)) {
                     echo '<p>' . __('No recent activity.', 'snn') . '</p>';
                 } else {
@@ -1445,9 +2358,9 @@ class Creem_API_WordPress {
             </div>
             
             <!-- Product Statistics -->
+            <?php if (!empty($stats['product_breakdown'])): ?>
             <div class="snn-creem-section">
                 <h2><?php _e('Product Breakdown', 'snn'); ?></h2>
-                <?php if (!empty($stats['product_breakdown'])): ?>
                 <table class="wp-list-table widefat fixed striped">
                     <thead>
                         <tr>
@@ -1464,12 +2377,8 @@ class Creem_API_WordPress {
                         <?php endforeach; ?>
                     </tbody>
                 </table>
-                <?php else: ?>
-                <p><?php _e('No product data yet.', 'snn'); ?></p>
-                <?php endif; ?>
             </div>
-            
-            </div><!-- .snn-creem-dashboard-sections -->
+            <?php endif; ?>
             
         </div>
         <?php
@@ -1503,6 +2412,11 @@ class Creem_API_WordPress {
             'creem_sale_id'
         );
         $stats['total_users'] = (int) $wpdb->get_var($total_users_query);
+        
+        // Total sales processed = users created from a creem sale (reuses the COUNT
+        // already computed above; +0 queries and immune to log rotation). This is the
+        // same metric as total_users because each first-time sale creates one user.
+        $stats['total_sales'] = $stats['total_users'];
         
         // Users created this month - using SQL count
         $month_start = date('Y-m-01 00:00:00');
@@ -1551,50 +2465,56 @@ class Creem_API_WordPress {
             $stats['top_product_count'] = (int) $product_results[0]->count;
         }
         
-        // Active subscriptions - using SQL query
-        // Count users with subscription_id in sale_data and status not 'cancelled'
+        // Active subscriptions - using SQL query.
+        // Count users with subscription_id in sale_data whose stored subscription
+        // status is neither an ended status nor 'paused' (paused users are
+        // downgraded to the default role and must not count as active), and who are
+        // not refunded (the refund path removes roles without writing
+        // creem_subscription_status, so a refunded-with-remove_roles user would
+        // otherwise still be counted as active). $wpdb->prepare cannot bind an
+        // array to IN(), so we build one placeholder per known status.
+        $inactive_statuses = array_merge(self::$ENDED_STATUSES, array('paused'));
+        $placeholders = implode(', ', array_fill(0, count($inactive_statuses), '%s'));
         $active_subs_query = $wpdb->prepare(
-            "SELECT COUNT(DISTINCT um1.user_id) 
-             FROM {$wpdb->usermeta} um1 
-             WHERE um1.meta_key = %s 
+            "SELECT COUNT(DISTINCT um1.user_id)
+             FROM {$wpdb->usermeta} um1
+             WHERE um1.meta_key = %s
              AND um1.meta_value LIKE %s
              AND um1.user_id NOT IN (
-                 SELECT user_id FROM {$wpdb->usermeta} 
-                 WHERE meta_key = %s AND meta_value = %s
+                 SELECT user_id FROM {$wpdb->usermeta}
+                 WHERE meta_key = %s AND meta_value IN ({$placeholders})
+             )
+             AND um1.user_id NOT IN (
+                 SELECT user_id FROM {$wpdb->usermeta}
+                 WHERE meta_key = %s
              )",
-            'creem_sale_data',
-            '%subscription_id%',
-            'creem_subscription_status',
-            'cancelled'
+            array_merge(
+                array('creem_sale_data', '%"subscription"%', 'creem_subscription_status'),
+                $inactive_statuses,
+                array('creem_refunded')
+            )
         );
         $stats['active_subscriptions'] = (int) $wpdb->get_var($active_subs_query);
         
-        // Count from logs
-        $logs = get_option($this->log_option_name, array());
-        $refund_count = 0;
+        // Refunds: persistent all-time counter (incremented once per processed
+        // refund in handle_refund). The log-based count we used before was both
+        // windowed (rotates in N days / capped at log_limit) and over-counted
+        // because strpos('refund') matched "Refund processing skipped" too.
+        $stats['total_refunds'] = intval(get_option('creem_refund_count', 0));
+
+        // Recent activity: still log-based (last 24h). A 24h window is always
+        // well inside the rotation window, so this stays accurate.
+        $logs = $this->get_logs();
         $activity_24h = 0;
         $cutoff_24h = date('Y-m-d H:i:s', strtotime('-24 hours'));
-        
+
         foreach ($logs as $log) {
-            if (isset($log['type']) && strpos(strtolower($log['type']), 'refund') !== false) {
-                $refund_count++;
-            }
             if (isset($log['timestamp']) && $log['timestamp'] >= $cutoff_24h) {
                 $activity_24h++;
             }
-            if (isset($log['type']) && $log['type'] === 'User created') {
-                $stats['total_sales']++;
-            }
         }
-        
-        $stats['total_refunds'] = $refund_count;
+
         $stats['activity_last_24h'] = $activity_24h;
-        
-        // If no users, use processed sales count
-        if ($stats['total_sales'] === 0) {
-            $processed_sales = get_option('creem_processed_sales', array());
-            $stats['total_sales'] = count($processed_sales);
-        }
         
         return $stats;
     }
@@ -1611,7 +2531,12 @@ class Creem_API_WordPress {
         $settings = get_option($this->option_name);
         $default_roles = isset($settings['default_roles']) ? $settings['default_roles'] : array('subscriber');
         $product_roles = isset($settings['product_roles']) ? $settings['product_roles'] : array();
-        
+
+        // Warn if a (customised) template still embeds the clear-text password tag.
+        if (isset($settings['email_template']) && strpos($settings['email_template'], '{{password}}') !== false) {
+            echo '<div class="notice notice-warning"><p>' . sprintf(__('Heads up: your email template still contains the %s tag, which sends the generated password in clear text. For better security, remove it and use %s so each customer sets their own password.', 'snn'), '<code>{{password}}</code>', '<code>{{password_reset_url}}</code>') . '</p></div>';
+        }
+
         ?>
         <div class="wrap">
             <h1><?php _e('Creem.io API Settings', 'snn'); ?></h1>
@@ -1659,7 +2584,7 @@ class Creem_API_WordPress {
                         <tr>
                             <th scope="row"><?php _e('Default User Roles', 'snn'); ?></th>
                             <td>
-                                <p class="description"><?php _e('Select default role(s) to assign to newly created users. These roles will be used when no product-specific roles are configured.', 'snn'); ?></p>
+                                <p class="description"><?php _e('Select default role(s) to assign to newly created users or paused subscription users. These roles will be used when no product-specific roles are configured.', 'snn'); ?></p>
                                 <?php
                                 global $wp_roles;
                                 $all_roles = $wp_roles->roles;
@@ -1745,10 +2670,10 @@ class Creem_API_WordPress {
                                         <li><code>{{site_url}}</code> - <?php _e('Your site URL', 'snn'); ?></li>
                                         <li><code>{{product_name}}</code> - <?php _e('Purchased product', 'snn'); ?></li>
                                         <li><code>{{username}}</code> - <?php _e("User's username", 'snn'); ?></li>
-                                        <li><code>{{password}}</code> - <?php _e('Generated password', 'snn'); ?></li>
+                                        <li><code>{{password}}</code> - <?php _e('Generated random password (not recommended — users should set their own via {{password_reset_url}})', 'snn'); ?></li>
                                         <li><code>{{email}}</code> - <?php _e("User's email", 'snn'); ?></li>
                                         <li><code>{{login_url}}</code> - <?php _e('WordPress login URL', 'snn'); ?></li>
-                                        <li><code>{{password_reset_url}}</code> - <?php _e('Password reset link', 'snn'); ?></li>
+                                        <li><code>{{password_reset_url}}</code> - <?php _e('Password reset link or Password first set-up link', 'snn'); ?></li>
                                     </ul>
                                     <h4>💡 <?php _e('Tips:', 'snn'); ?></h4>
                                     <ul>
@@ -1900,6 +2825,16 @@ class Creem_API_WordPress {
                             <td>
                                 <input type="number" name="log_rotation_days" id="log_rotation_days" value="<?php echo esc_attr(isset($settings['log_rotation_days']) ? $settings['log_rotation_days'] : 30); ?>" class="small-text" min="1" />
                                 <p class="description"><?php _e('Automatically delete logs older than this many days (default: 30)', 'snn'); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th scope="row"><?php _e('Debug Mode', 'snn'); ?></th>
+                            <td>
+                                <label>
+                                    <input type="checkbox" name="debug_mode" value="1" <?php checked(isset($settings['debug_mode']) ? $settings['debug_mode'] : false, 1); ?> />
+                                    <?php _e('Log full raw API payloads (responses, transactions, sale data)', 'snn'); ?>
+                                </label>
+                                <p class="description"><?php _e('When disabled (default), only compact summaries are logged to keep the activity log small. Enable only while troubleshooting, then turn it off again.', 'snn'); ?></p>
                             </td>
                         </tr>
                     </table>
@@ -2093,14 +3028,6 @@ class Creem_API_WordPress {
     }
     
     /**
-     * Render product role row (deprecated, kept for compatibility)
-     */
-    private function render_product_role_row($product_id, $role) {
-        // This method is no longer used but kept for backward compatibility
-        return;
-    }
-    
-    /**
      * Save settings
      */
     private function save_settings($post_data) {
@@ -2110,14 +3037,14 @@ class Creem_API_WordPress {
         $settings = array(
             'access_token' => isset($post_data['access_token']) ? sanitize_text_field($post_data['access_token']) : '',
             'test_mode' => isset($post_data['test_mode']) ? true : false,
-            'default_roles' => isset($post_data['default_roles']) ? array_map('sanitize_text_field', $post_data['default_roles']) : array(),
-            'cron_interval' => isset($post_data['cron_interval']) ? intval($post_data['cron_interval']) : 120,
-            'sales_limit' => isset($post_data['sales_limit']) ? intval($post_data['sales_limit']) : 50,
+            'default_roles' => (isset($post_data['default_roles']) && is_array($post_data['default_roles'])) ? array_map('sanitize_text_field', $post_data['default_roles']) : array(),
+            'cron_interval' => max(30, isset($post_data['cron_interval']) ? intval($post_data['cron_interval']) : 120),
+            'sales_limit' => max(1, isset($post_data['sales_limit']) ? intval($post_data['sales_limit']) : 50),
             'send_welcome_email' => isset($post_data['send_welcome_email']) ? true : false,
             'email_subject' => isset($post_data['email_subject']) ? sanitize_text_field($post_data['email_subject']) : '',
             'email_template' => isset($post_data['email_template']) ? wp_kses_post($post_data['email_template']) : '',
-            'log_limit' => isset($post_data['log_limit']) ? intval($post_data['log_limit']) : 500,
-            'user_list_per_page' => isset($post_data['user_list_per_page']) ? intval($post_data['user_list_per_page']) : 20,
+            'log_limit' => isset($post_data['log_limit']) ? intval($post_data['log_limit']) : (isset($existing_settings['log_limit']) ? intval($existing_settings['log_limit']) : 500),
+            'user_list_per_page' => isset($post_data['user_list_per_page']) ? intval($post_data['user_list_per_page']) : (isset($existing_settings['user_list_per_page']) ? intval($existing_settings['user_list_per_page']) : 20),
             'product_roles' => array(),
             'product_auto_create' => array(),
             'products' => isset($existing_settings['products']) ? $existing_settings['products'] : array(),
@@ -2126,7 +3053,8 @@ class Creem_API_WordPress {
             'handle_subscriptions' => isset($post_data['handle_subscriptions']) ? true : false,
             'subscription_cancellation_action' => isset($post_data['subscription_cancellation_action']) ? sanitize_text_field($post_data['subscription_cancellation_action']) : 'remove_roles',
             'subscription_renewal_page' => isset($post_data['subscription_renewal_page']) ? intval($post_data['subscription_renewal_page']) : '',
-            'log_rotation_days' => isset($post_data['log_rotation_days']) ? intval($post_data['log_rotation_days']) : 30
+            'log_rotation_days' => max(1, isset($post_data['log_rotation_days']) ? intval($post_data['log_rotation_days']) : 30),
+            'debug_mode' => isset($post_data['debug_mode']) ? true : false
         );
 
         // Process product roles
@@ -2220,8 +3148,11 @@ class Creem_API_WordPress {
             wp_send_json_error(array('message' => 'API Error (' . $http_code . '): ' . $error_message));
         }
 
-        // Success - API connection works
-        if ($http_code === 200 && isset($data['items'])) {
+        // Success - API connection works. Accept BOTH list shapes recognized by
+        // parse_creem_list() (empirical {items,...} and documented {data,has_more}),
+        // so a future Creem API migration to the documented shape does not turn a
+        // valid API key into a false "Unexpected response format" error. (M1)
+        if ($http_code === 200 && (isset($data['items']) || isset($data['data']))) {
             $mode = $test_mode ? 'Test Mode' : 'Production Mode';
             wp_send_json_success(array('message' => 'Connected successfully! (' . $mode . ')'));
         } else {
@@ -2249,10 +3180,15 @@ class Creem_API_WordPress {
         $test_mode = isset($_POST['test_mode']) && $_POST['test_mode'] === 'true';
         $base_url = $test_mode ? 'https://test-api.creem.io' : 'https://api.creem.io';
 
-        // Fetch all products with pagination
+        // Fetch all products with pagination. Mirror check_recent_sales(): drive the
+        // page counter ourselves and treat pagination.next_page only as a "has more"
+        // flag (immune to next_page being a bool/URL instead of a page number), plus a
+        // hard max_pages cap so a malformed API response can't loop the AJAX handler
+        // forever. (The cron path already had this cap; the products fetch did not.)
         $all_products = array();
-        $page_number = 1;
         $page_size = 50; // Fetch 50 products per page
+        $page_number = 1;
+        $max_pages = 20; // hard safety cap (20 x 50 = 1000 products)
 
         do {
             $url = $base_url . '/v1/products/search?page_number=' . $page_number . '&page_size=' . $page_size;
@@ -2280,20 +3216,21 @@ class Creem_API_WordPress {
                 wp_send_json_error(array('message' => 'API Error (' . $http_code . '): ' . $error_message));
             }
 
-            // Parse products response
-            $products = $this->parse_creem_products($data);
+            // Normalize the list response (both documented and empirical shapes),
+            // then map the raw items into product rows. parse_creem_list emits an
+            // explicit log if neither shape is recognized.
+            $list = $this->parse_creem_list($data, 'products/search');
+            $products = $this->parse_creem_products(array('items' => $list['items']));
             if (!empty($products)) {
                 $all_products = array_merge($all_products, $products);
             }
 
-            // Check if there are more pages
-            $has_more_pages = false;
-            if (isset($data['pagination']) && isset($data['pagination']['next_page_number'])) {
-                $has_more_pages = !is_null($data['pagination']['next_page_number']);
-                $page_number = $data['pagination']['next_page_number'];
-            }
+            // Stop when there are no more pages (recognized via either shape) or we
+            // hit the hard page cap. Aligns with check_recent_sales().
+            $has_more_pages = $list['has_more'];
+            $page_number++;
 
-        } while ($has_more_pages);
+        } while ($has_more_pages && $page_number <= $max_pages);
 
         // Log the fetch for debugging
         $this->log_activity('Products Fetched', array(
@@ -2321,7 +3258,7 @@ class Creem_API_WordPress {
         }
         
         $settings = get_option($this->option_name);
-        $logs = get_option($this->log_option_name, array());
+        $logs = $this->get_logs();
         $per_page = 20;
         $page = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
         $total_logs = count($logs);
@@ -2666,7 +3603,16 @@ class Creem_API_WordPress {
                                             <tr><th><?php _e('Product Name', 'snn'); ?></th><td><?php echo esc_html($product_name ? $product_name : 'N/A'); ?></td></tr>
                                             <tr><th><?php _e('Product ID', 'snn'); ?></th><td><code><?php echo esc_html($product_id ? $product_id : 'N/A'); ?></code></td></tr>
                                             <tr><th><?php _e('Created Date', 'snn'); ?></th><td><?php echo esc_html($created_date ? $created_date : 'N/A'); ?></td></tr>
-                                            <tr><th><?php _e('Assigned Roles', 'snn'); ?></th><td><?php echo esc_html($assigned_roles ? implode(', ', json_decode($assigned_roles, true)) : 'N/A'); ?></td></tr>
+                                            <tr><th><?php _e('Assigned Roles', 'snn'); ?></th><td><?php
+                                                $assigned_roles_display = 'N/A';
+                                                if (!empty($assigned_roles)) {
+                                                    $ar_decoded = json_decode($assigned_roles, true);
+                                                    if (is_array($ar_decoded) && !empty($ar_decoded)) {
+                                                        $assigned_roles_display = implode(', ', $ar_decoded);
+                                                    }
+                                                }
+                                                echo esc_html($assigned_roles_display);
+                                            ?></td></tr>
                                         </table>
                                         
                                         <h3><?php _e('Email Status', 'snn'); ?></h3>
@@ -2811,30 +3757,15 @@ class Creem_API_WordPress {
                     <ul style="margin: 10px 0; padding-left: 20px;">
                         <li><strong><?php _e('Main Plugin Settings:', 'snn'); ?></strong> creem_api_settings</li>
                         <li><strong><?php _e('Activity Logs:', 'snn'); ?></strong> <?php echo number_format($data_stats['logs_count']); ?> entries</li>
-                        <li><strong><?php _e('Processed Sales List:', 'snn'); ?></strong> <?php echo number_format($data_stats['processed_sales_count']); ?> sale IDs</li>
                         <li><strong><?php _e('Scheduled Cron Jobs:', 'snn'); ?></strong> creem_api_check_sales</li>
                     </ul>
                     
                     <h4><?php _e('User Metadata (from Creem.io Users)', 'snn'); ?></h4>
                     <ul style="margin: 10px 0; padding-left: 20px;">
                         <li><strong><?php _e('Total affected users:', 'snn'); ?></strong> <?php echo number_format($data_stats['creem_users_count']); ?></li>
-                        <li><?php _e('creem_sale_id - Original sale ID', 'snn'); ?></li>
-                        <li><?php _e('creem_product_name - Purchased product name', 'snn'); ?></li>
-                        <li><?php _e('creem_product_id - Product ID', 'snn'); ?></li>
-                        <li><?php _e('creem_created_date - User creation date', 'snn'); ?></li>
-                        <li><?php _e('creem_sale_data - Raw sale data JSON', 'snn'); ?></li>
-                        <li><?php _e('creem_assigned_roles - Roles assigned by plugin', 'snn'); ?></li>
-                        <li><?php _e('creem_email_sent - Email sent status', 'snn'); ?></li>
-                        <li><?php _e('creem_email_sent_date - Email sent timestamp', 'snn'); ?></li>
-                        <li><?php _e('creem_last_purchase_date - Last purchase date', 'snn'); ?></li>
-                        <li><?php _e('creem_last_product_name - Last purchased product', 'snn'); ?></li>
-                        <li><?php _e('creem_last_product_id - Last product ID', 'snn'); ?></li>
-                        <li><?php _e('creem_last_sale_id - Last sale ID', 'snn'); ?></li>
-                        <li><?php _e('creem_purchase_history - Purchase history JSON', 'snn'); ?></li>
-                        <li><?php _e('creem_refunded - Refund status', 'snn'); ?></li>
-                        <li><?php _e('creem_refunded_date - Refund date', 'snn'); ?></li>
-                        <li><?php _e('creem_subscription_status - Subscription status', 'snn'); ?></li>
-                        <li><?php _e('creem_subscription_ended_date - Subscription end date', 'snn'); ?></li>
+                        <?php foreach ($this->managed_user_meta_keys() as $meta_key => $meta_desc): ?>
+                            <li><?php echo esc_html($meta_key); ?> - <?php echo esc_html($meta_desc); ?></li>
+                        <?php endforeach; ?>
                     </ul>
                     
                     <p style="margin-top: 15px;"><strong><?php _e('Note:', 'snn'); ?></strong> <?php _e('WordPress user accounts will NOT be deleted, only the creem metadata will be removed.', 'snn'); ?></p>
@@ -2924,17 +3855,12 @@ class Creem_API_WordPress {
     private function get_uninstall_data_statistics() {
         $stats = array(
             'logs_count' => 0,
-            'processed_sales_count' => 0,
             'creem_users_count' => 0
         );
         
         // Count logs
-        $logs = get_option($this->log_option_name, array());
+        $logs = $this->get_logs();
         $stats['logs_count'] = count($logs);
-        
-        // Count processed sales
-        $processed_sales = get_option('creem_processed_sales', array());
-        $stats['processed_sales_count'] = count($processed_sales);
         
         // Count users with creem metadata
         $user_query = new WP_User_Query(array(
@@ -2981,6 +3907,37 @@ class Creem_API_WordPress {
     }
     
     /**
+     * Single source of truth for every user meta key written by this plugin,
+     * mapped to a human-readable description. Used by both delete_all_plugin_data()
+     * (to know what to delete) and uninstall_page() (to show what will be deleted),
+     * so the two lists can never drift out of sync.
+     */
+    private function managed_user_meta_keys() {
+        return array(
+            'creem_sale_id'                 => __('Original sale ID', 'snn'),
+            'creem_product_name'            => __('Purchased product name', 'snn'),
+            'creem_product_id'              => __('Product ID', 'snn'),
+            'creem_created_date'            => __('User creation date', 'snn'),
+            'creem_sale_data'               => __('Raw sale data JSON', 'snn'),
+            'creem_assigned_roles'          => __('Roles assigned by plugin', 'snn'),
+            'creem_email_sent'              => __('Email sent status', 'snn'),
+            'creem_email_sent_date'         => __('Email sent timestamp', 'snn'),
+            'creem_last_purchase_date'      => __('Last purchase date', 'snn'),
+            'creem_last_product_name'       => __('Last purchased product', 'snn'),
+            'creem_last_product_id'         => __('Last product ID', 'snn'),
+            'creem_last_sale_id'            => __('Last sale ID', 'snn'),
+            'creem_purchase_history'        => __('Purchase history JSON', 'snn'),
+            'creem_refunded'                => __('Refund status', 'snn'),
+            'creem_refunded_date'           => __('Refund date', 'snn'),
+            'creem_subscription_status'     => __('Subscription status', 'snn'),
+            'creem_subscription_ended_date' => __('Subscription end date', 'snn'),
+            'creem_subscription_ends_at'    => __('Subscription period end date', 'snn'),
+            'creem_customer_id'             => __('Creem customer ID', 'snn'),
+            'creem_processed_sale_ids'      => __('Processed sale IDs (idempotency set)', 'snn'),
+        );
+    }
+
+    /**
      * Delete all plugin data
      */
     private function delete_all_plugin_data() {
@@ -2996,38 +3953,18 @@ class Creem_API_WordPress {
             $deleted_data[] = __('Activity Logs', 'snn');
         }
         
-        if (delete_option('creem_processed_sales')) {
-            $deleted_data[] = __('Processed Sales List', 'snn');
-        }
-        
-        // 2. Remove scheduled cron jobs
-        $timestamp = wp_next_scheduled('creem_api_check_sales');
-        if ($timestamp) {
-            wp_unschedule_event($timestamp, 'creem_api_check_sales');
+        // 2. Remove scheduled cron jobs (clear all instances for robustness).
+        $cleared = wp_clear_scheduled_hook('creem_api_check_sales');
+        if ($cleared) {
             $deleted_data[] = __('Cron Jobs', 'snn');
         }
         
-        // 3. Delete all user meta data with creem prefix
-        $creem_meta_keys = array(
-            'creem_sale_id',
-            'creem_product_name',
-            'creem_product_id',
-            'creem_created_date',
-            'creem_sale_data',
-            'creem_assigned_roles',
-            'creem_email_sent',
-            'creem_email_sent_date',
-            'creem_last_purchase_date',
-            'creem_last_product_name',
-            'creem_last_product_id',
-            'creem_last_sale_id',
-            'creem_purchase_history',
-            'creem_refunded',
-            'creem_refunded_date',
-            'creem_subscription_status',
-            'creem_subscription_ended_date',
-            'creem_customer_id'
-        );
+        // 3. Delete all user meta data with creem prefix. The single source of
+        // truth (managed_user_meta_keys) is shared with the uninstall UI so the
+        // two lists can never drift; this also catches creem_subscription_ends_at,
+        // which was previously orphaned (the options catch-all below only deletes
+        // from {options}, not {usermeta}).
+        $creem_meta_keys = array_keys($this->managed_user_meta_keys());
         
         $total_meta_deleted = 0;
         foreach ($creem_meta_keys as $meta_key) {
@@ -3056,6 +3993,14 @@ class Creem_API_WordPress {
     public function check_subscription_renewal_redirect() {
         // Don't run on admin pages
         if (is_admin()) {
+            return;
+        }
+
+        // Don't interfere with login/registration, AJAX, or REST requests.
+        if ((defined('DOING_AJAX') && DOING_AJAX) || (defined('REST_REQUEST') && REST_REQUEST)) {
+            return;
+        }
+        if (isset($GLOBALS['pagenow']) && in_array($GLOBALS['pagenow'], array('wp-login.php', 'wp-register.php', 'wp-signup.php'), true)) {
             return;
         }
 
@@ -3103,7 +4048,7 @@ class Creem_API_WordPress {
         $subscription_status = get_user_meta($current_user->ID, 'creem_subscription_status', true);
 
         // If subscription is cancelled or ended, redirect to renewal page
-        if ($subscription_status === 'cancelled') {
+        if (in_array($subscription_status, self::$ENDED_STATUSES, true)) {
             // Check if user lost their roles (which means subscription was processed as ended)
             $assigned_roles = get_user_meta($current_user->ID, 'creem_assigned_roles', true);
             if ($assigned_roles) {
@@ -3120,6 +4065,16 @@ class Creem_API_WordPress {
 
                     // If user doesn't have any of their assigned roles, subscription has ended
                     if (!$has_any_role) {
+                        // Allow third-party code to whitelist pages that must stay
+                        // reachable even for expired subscribers (e.g. WooCommerce
+                        // cart/checkout, contact page). Example:
+                        // add_filter('creem_skip_renewal_redirect', function($skip) {
+                        //     return is_page(array('cart','checkout','contact'));
+                        // });
+                        if (apply_filters('creem_skip_renewal_redirect', false)) {
+                            return;
+                        }
+
                         // Get product information for logging
                         $product_name = get_user_meta($current_user->ID, 'creem_product_name', true);
 
@@ -3131,8 +4086,16 @@ class Creem_API_WordPress {
                             'renewal_page_id' => $renewal_page_id
                         ));
 
-                        // Redirect to renewal page
-                        wp_redirect(get_permalink($renewal_page_id));
+                        // Redirect to renewal page. Guard against a missing/trashed
+                        // page: get_permalink() returns false in that case, and
+                        // wp_redirect(false) emits an empty Location header that can
+                        // send the browser into a redirect loop on every frontend page.
+                        $renewal_url = get_permalink($renewal_page_id);
+                        if (!$renewal_url) {
+                            return;
+                        }
+
+                        wp_redirect($renewal_url);
                         exit;
                     }
                 }
@@ -3180,6 +4143,72 @@ class Creem_API_WordPress {
     }
 
     /**
+     * Resolve the Creem customer_id for a user: from the cached creem_customer_id
+     * meta, falling back to the customer reference embedded in creem_sale_data
+     * (and caching it). Shared by the billing shortcode and the AJAX endpoint so
+     * the two never drift. (Review fix: duplication.)
+     *
+     * @param int $user_id
+     * @return string
+     */
+    private function resolve_customer_id($user_id) {
+        $customer_id = get_user_meta($user_id, 'creem_customer_id', true);
+        if (empty($customer_id)) {
+            $sale_data_json = get_user_meta($user_id, 'creem_sale_data', true);
+            if (!empty($sale_data_json)) {
+                $sale_data = json_decode($sale_data_json, true);
+                if (is_array($sale_data) && isset($sale_data['customer'])) {
+                    if (is_string($sale_data['customer']) && !empty($sale_data['customer'])) {
+                        $customer_id = $sale_data['customer'];
+                    } elseif (is_array($sale_data['customer']) && !empty($sale_data['customer']['id'])) {
+                        $customer_id = $sale_data['customer']['id'];
+                    }
+                }
+                if (!empty($customer_id)) {
+                    update_user_meta($user_id, 'creem_customer_id', $customer_id);
+                }
+            }
+        }
+        return $customer_id;
+    }
+
+    /**
+     * AJAX handler: generate the Creem customer billing portal link on demand
+     * (only when the user clicks the billing button). This replaces the old
+     * on-render call, so loading a page with [creem_billing_link] no longer hits
+     * the Creem API and never wastes a single-use token.
+     *
+     * Security: the customer_id is ALWAYS resolved server-side from the logged-in
+     * user's own meta (same logic as the shortcode). A client-supplied customer_id
+     * is never trusted, so one user cannot request another user's portal link.
+     */
+    public function ajax_billing_link() {
+        check_ajax_referer('creem_billing_link_nonce', 'nonce');
+
+        if (!is_user_logged_in()) {
+            wp_send_json_error(array('message' => __('Not logged in', 'snn')), 403);
+        }
+
+        $user_id = get_current_user_id();
+
+        // Resolve the customer_id server-side from the current user's own meta
+        // (shared helper). Never trust a client-supplied customer_id.
+        $customer_id = $this->resolve_customer_id($user_id);
+
+        if (empty($customer_id)) {
+            wp_send_json_error(array('message' => __('No subscription found', 'snn')), 404);
+        }
+
+        $portal_link = $this->generate_customer_portal_link($customer_id);
+
+        if (is_wp_error($portal_link) || empty($portal_link)) {
+            wp_send_json_error(array('message' => __('Billing temporarily unavailable', 'snn')));
+        }
+
+        wp_send_json_success(array('url' => $portal_link));
+    }
+
+    /**
      * Shortcode: [creem_billing_link]
      *
      * Renders a customer billing portal link for the currently logged-in user.
@@ -3211,27 +4240,10 @@ class Creem_API_WordPress {
 
         $current_user = wp_get_current_user();
 
-        // Retrieve stored customer ID.
-        $customer_id = get_user_meta($current_user->ID, 'creem_customer_id', true);
-
-        // If not cached, try to extract it from the raw sale data.
-        if (empty($customer_id)) {
-            $sale_data_json = get_user_meta($current_user->ID, 'creem_sale_data', true);
-            if (!empty($sale_data_json)) {
-                $sale_data = json_decode($sale_data_json, true);
-                if (is_array($sale_data) && isset($sale_data['customer'])) {
-                    if (is_string($sale_data['customer']) && !empty($sale_data['customer'])) {
-                        $customer_id = $sale_data['customer'];
-                    } elseif (is_array($sale_data['customer']) && !empty($sale_data['customer']['id'])) {
-                        $customer_id = $sale_data['customer']['id'];
-                    }
-                }
-                // Cache for future shortcode renders.
-                if (!empty($customer_id)) {
-                    update_user_meta($current_user->ID, 'creem_customer_id', $customer_id);
-                }
-            }
-        }
+        // Resolve customer_id locally (no API call) via the shared helper. The
+        // portal link itself is generated on click via AJAX (ajax_billing_link),
+        // so the page load never hits the Creem API and never wastes a token.
+        $customer_id = $this->resolve_customer_id($current_user->ID);
 
         if (empty($customer_id)) {
             return !empty($atts['no_subscription_text'])
@@ -3239,17 +4251,106 @@ class Creem_API_WordPress {
                 : '';
         }
 
-        $portal_link = $this->generate_customer_portal_link($customer_id);
+        // Render a click-triggered button: the portal link is generated ONLY on
+        // click via AJAX (ajax_billing_link). This avoids hitting the Creem API
+        // on every page load (rate-limit friendly) and never wastes a single-use
+        // token, since the link is created exactly when the user uses it.
+        $nonce = wp_create_nonce('creem_billing_link_nonce');
+        $classes = 'creem-billing-link' . (!empty($atts['class']) ? ' ' . esc_attr($atts['class']) : '');
 
-        if (is_wp_error($portal_link)) {
-            return '';
-        }
-
-        $class_attr = !empty($atts['class']) ? ' class="' . esc_attr($atts['class']) . '"' : '';
-
-        return '<a href="' . esc_url($portal_link) . '"' . $class_attr . ' target="_blank" rel="noopener noreferrer">'
+        $html = '<a href="#" class="' . esc_attr($classes) . '" '
+            . 'data-nonce="' . esc_attr($nonce) . '" '
+            . 'data-loading="' . esc_attr__('Loading...', 'snn') . '" '
+            . 'data-error="' . esc_attr__('Billing temporarily unavailable', 'snn') . '">'
             . esc_html($atts['text'])
             . '</a>';
+
+        // Print the click handler once per page (the shortcode may render many
+        // times; a static guard avoids duplicating the script).
+        $html .= $this->creem_billing_link_script();
+
+        return $html;
+    }
+
+    /**
+     * Inline JS for the click-triggered billing link. Delegates clicks on any
+     * <a class="creem-billing-link"> to an AJAX call that returns a fresh portal
+     * link, then opens it in a new tab. Printed at most once per request via a
+     * static guard (and double-guarded in JS with a window flag).
+     *
+     * @return string
+     */
+    private function creem_billing_link_script() {
+        static $printed = false;
+        if ($printed) {
+            return '';
+        }
+        $printed = true;
+
+        $ajax_url = admin_url('admin-ajax.php');
+        ob_start();
+        ?>
+<script>
+(function () {
+    if (window.__creemBillingInit) { return; }
+    window.__creemBillingInit = true;
+
+    function bind() {
+        document.addEventListener('click', function (e) {
+            var link = (e.target && e.target.closest) ? e.target.closest('a.creem-billing-link') : null;
+            if (!link) { return; }
+            e.preventDefault();
+            if (link.getAttribute('data-busy') === '1') { return; }
+            link.setAttribute('data-busy', '1');
+
+            var originalText = link.textContent;
+            var loadingText = link.getAttribute('data-loading') || 'Loading...';
+            var errorText = link.getAttribute('data-error') || 'Billing temporarily unavailable';
+            link.textContent = loadingText;
+
+            var body = 'action=creem_billing_link&nonce=' + encodeURIComponent(link.getAttribute('data-nonce') || '');
+
+            fetch(<?php echo wp_json_encode($ajax_url); ?>, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                body: body
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (res) {
+                if (res && res.success && res.data && res.data.url && /^https?:\/\//i.test(res.data.url)) {
+                    link.textContent = originalText;
+                    // window.open() inside an async fetch handler runs outside the
+                    // browser's direct user-gesture window, so it is frequently
+                    // blocked by popup blockers. Fall back to a same-tab redirect
+                    // when the new tab was blocked, so the billing portal is always
+                    // reachable. (M5)
+                    var win = window.open(res.data.url, '_blank');
+                    if (!win) {
+                        window.location.href = res.data.url;
+                    }
+                } else {
+                    link.textContent = (res && res.data && res.data.message) ? res.data.message : errorText;
+                }
+            })
+            .catch(function () {
+                link.textContent = errorText;
+            })
+            .then(function () {
+                link.removeAttribute('data-busy');
+            });
+        });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', bind);
+    } else {
+        bind();
+    }
+})();
+</script>
+        <?php
+        return ob_get_clean();
     }
 }
 
