@@ -36,6 +36,20 @@ Automatically create WordPress users from Creem.io sales with API.
 Optional attributes: `text`, `class`, `not_logged_in_text`, `no_subscription_text`
 Example: `[creem_billing_link text="Manage Billing" class="button"]`
 Example: `[creem_billing_link not_logged_in_text="Please log in to manage your subscription."]`
+The portal link is created when the user clicks, so pages with the shortcode don't call the Creem API on load.
+
+**How sales are handled**
+- Subscriptions and one-time purchases both create users.
+- Full refunds and chargebacks remove the roles the plugin granted; partial refunds keep access.
+- Canceled, unpaid or past-due subscriptions keep access until the paid period ends.
+- Roles a user already had before buying are never removed.
+
+**Developer filter:** `creem_skip_renewal_redirect` — return `true` to keep a page reachable for users whose subscription ended.
+```php
+add_filter('creem_skip_renewal_redirect', function ($skip) {
+    return $skip || is_page(array('checkout', 'contact'));
+});
+```
 
 
 <img width="1903" height="976" alt="image" src="https://github.com/user-attachments/assets/ae03fa9c-aafe-427b-b3fb-6ae898111fc0" />

@@ -41,6 +41,7 @@ class Creem_API_WordPress {
         add_action('wp_ajax_creem_clear_logs', array($this, 'clear_logs'));
         add_action('wp_ajax_creem_fetch_products', array($this, 'fetch_products'));
         add_action('wp_ajax_creem_uninstall_plugin', array($this, 'uninstall_plugin_data'));
+        add_action('wp_ajax_creem_billing_link', array($this, 'ajax_billing_link'));
         
         // Add admin styles
         add_action('admin_head', array($this, 'admin_styles'));
@@ -59,8 +60,8 @@ class Creem_API_WordPress {
      * Add admin styles
      */
     public function admin_styles() {
-        $screen = get_current_screen();
-        if (strpos($screen->id, 'creem-api') === false) {
+        $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+        if (!$screen || strpos($screen->id, 'creem-api') === false) {
             return;
         }
         ?>
@@ -239,10 +240,7 @@ class Creem_API_WordPress {
      * Plugin deactivation
      */
     public function deactivate() {
-        $timestamp = wp_next_scheduled('creem_api_check_sales');
-        if ($timestamp) {
-            wp_unschedule_event($timestamp, 'creem_api_check_sales');
-        }
+        wp_clear_scheduled_hook('creem_api_check_sales');
     }
     
     /**
@@ -250,7 +248,7 @@ class Creem_API_WordPress {
      */
     public function add_custom_cron_interval($schedules) {
         $settings = get_option($this->option_name);
-        $interval = isset($settings['cron_interval']) ? intval($settings['cron_interval']) : 120;
+        $interval = isset($settings['cron_interval']) ? max(30, intval($settings['cron_interval'])) : 120;
         
         $schedules['creem_custom'] = array(
             'interval' => $interval,
@@ -264,10 +262,8 @@ class Creem_API_WordPress {
      * Schedule cron job
      */
     private function schedule_cron() {
-        $timestamp = wp_next_scheduled('creem_api_check_sales');
-        if ($timestamp) {
-            wp_unschedule_event($timestamp, 'creem_api_check_sales');
-        }
+        // Clears every scheduled instance, not just the next one
+        wp_clear_scheduled_hook('creem_api_check_sales');
 
         wp_schedule_event(time(), 'creem_custom', 'creem_api_check_sales');
     }
@@ -351,32 +347,68 @@ class Creem_API_WordPress {
     }
 
     /**
-     * Parse Creem.io transactions response
-     * Creem.io uses simple JSON format, not JSON:API
+     * Subscription statuses that end access once the paid period is over.
+     * Creem uses the American spelling "canceled".
      */
-    private function parse_creem_transactions($json_data) {
-        $transactions = array();
-        if (!isset($json_data['items']) || !is_array($json_data['items'])) {
-            return $transactions;
+    private static $ENDED_STATUSES = array('canceled', 'unpaid', 'past_due');
+
+    /**
+     * Per-request cache of API lookups (subscriptions, customers, orders, products).
+     */
+    private $api_cache = array();
+
+    /**
+     * Base API URL for the configured mode
+     */
+    private function get_base_url() {
+        $settings = get_option($this->option_name);
+        $test_mode = isset($settings['test_mode']) && $settings['test_mode'];
+        return $test_mode ? 'https://test-api.creem.io' : 'https://api.creem.io';
+    }
+
+    /**
+     * GET a Creem.io endpoint and return the decoded body, or WP_Error.
+     * Results (including errors) are cached for the current request.
+     */
+    private function api_get($api_key, $path) {
+        if (array_key_exists($path, $this->api_cache)) {
+            return $this->api_cache[$path];
         }
 
-        foreach ($json_data['items'] as $item) {
-            // Return the entire raw item
-            $transactions[] = $item;
+        $url = $this->get_base_url() . $path;
+        $response = wp_remote_get($url, array(
+            'headers' => $this->get_api_headers($api_key),
+            'timeout' => 20
+        ));
+
+        if (is_wp_error($response)) {
+            $this->log_activity('API request error', array('url' => $url, 'error' => $response->get_error_message()));
+            return $this->api_cache[$path] = $response;
         }
-        return $transactions;
+
+        $http_code = wp_remote_retrieve_response_code($response);
+        $data = json_decode(wp_remote_retrieve_body($response), true);
+
+        if ($http_code >= 400 || !is_array($data)) {
+            $error_msg = $this->get_api_error_message($data);
+            $this->log_activity('API error', array('url' => $url, 'http_code' => $http_code, 'error' => $error_msg));
+            return $this->api_cache[$path] = new WP_Error('api_error', $error_msg);
+        }
+
+        return $this->api_cache[$path] = $data;
     }
 
     /**
      * Extract subscription ID from transaction
      * In Creem.io, subscription ID is directly in the transaction object
      */
-    private function extract_subscription_id($transaction_item, $api_key = '') {
-        // Direct field access for Creem.io
-        if (isset($transaction_item['subscription']) && !empty($transaction_item['subscription'])) {
+    private function extract_subscription_id($transaction_item) {
+        if (isset($transaction_item['subscription']) && is_string($transaction_item['subscription'])) {
             return $transaction_item['subscription'];
         }
-
+        if (isset($transaction_item['subscription']['id'])) {
+            return $transaction_item['subscription']['id'];
+        }
         return '';
     }
 
@@ -388,66 +420,196 @@ class Creem_API_WordPress {
             return new WP_Error('invalid_params', 'API key and subscription ID are required');
         }
 
-        // Determine which API URL to use based on mode
-        $settings = get_option($this->option_name);
-        $test_mode = isset($settings['test_mode']) && $settings['test_mode'];
-        $base_url = $test_mode ? 'https://test-api.creem.io' : 'https://api.creem.io';
-        
-        $url = "{$base_url}/v1/subscriptions?subscription_id={$subscription_id}";
-
-        $this->log_activity('FETCHING SUBSCRIPTION', array(
-            'url' => $url,
-            'subscription_id' => $subscription_id
-        ));
-
-        $response = wp_remote_get($url, array(
-            'headers' => $this->get_api_headers($api_key)
-        ));
-
-        if (is_wp_error($response)) {
-            $this->log_activity('Subscription fetch error', array(
-                'subscription_id' => $subscription_id,
-                'url' => $url,
-                'error' => $response->get_error_message()
-            ));
-            return $response;
+        $data = $this->api_get($api_key, '/v1/subscriptions?subscription_id=' . rawurlencode($subscription_id));
+        if (!is_wp_error($data) && !isset($data['id'])) {
+            return new WP_Error('api_error', $this->get_api_error_message($data));
         }
-
-        $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body, true);
-
-        // Log raw subscription data for debugging
-        $this->log_activity('RAW SUBSCRIPTION RESPONSE', array(
-            'subscription_id' => $subscription_id,
-            'url' => $url,
-            'raw_response' => $data
-        ));
-
-        if (!isset($data['id'])) {
-            $error_msg = isset($data['error']) ? $data['error'] : 'Unknown API error';
-            $this->log_activity('Subscription API error', array(
-                'subscription_id' => $subscription_id,
-                'error' => $error_msg,
-                'response' => $data
-            ));
-            return new WP_Error('api_error', $error_msg);
-        }
-
         return $data;
     }
 
     /**
-     * Parse Creem.io customer response
+     * Fetch a customer by ID from Creem.io API
      */
-    private function parse_creem_customer($json_data) {
-        if (!isset($json_data['id'])) {
-            return null;
+    private function fetch_customer($api_key, $customer_id) {
+        if (empty($customer_id) || empty($api_key)) {
+            return new WP_Error('invalid_params', 'API key and customer ID are required');
         }
-        return array(
-            'id' => isset($json_data['id']) ? $json_data['id'] : '',
-            'name' => isset($json_data['name']) ? $json_data['name'] : '',
-            'email' => isset($json_data['email']) ? $json_data['email'] : ''
-        );
+
+        $data = $this->api_get($api_key, '/v1/customers?customer_id=' . rawurlencode($customer_id));
+        if (!is_wp_error($data) && !isset($data['email'])) {
+            return new WP_Error('api_error', 'Customer response has no email');
+        }
+        return $data;
+    }
+
+    /**
+     * Find the product of an order by paging through the customer's orders.
+     * Transactions carry the order ID but no product, so this is how one-time
+     * purchases are mapped to a product.
+     *
+     * @return array|WP_Error Product array with at least 'id' (and 'name' when known)
+     */
+    private function fetch_order_product($api_key, $customer_id, $order_id) {
+        if (empty($customer_id) || empty($order_id)) {
+            return new WP_Error('invalid_params', 'Customer ID and order ID are required');
+        }
+
+        $page_number = 1;
+        do {
+            $data = $this->api_get($api_key, '/v1/customers/' . rawurlencode($customer_id) . '/orders?page_size=50&page_number=' . $page_number);
+            if (is_wp_error($data)) {
+                return $data;
+            }
+
+            $items = isset($data['items']) && is_array($data['items']) ? $data['items'] : array();
+            foreach ($items as $order) {
+                if (isset($order['id']) && $order['id'] === $order_id && !empty($order['product'])) {
+                    return $this->normalize_product($api_key, $order['product']);
+                }
+            }
+
+            $has_next_page = !empty($data['pagination']['next_page']);
+            $page_number++;
+        } while ($has_next_page && $page_number <= 10);
+
+        return new WP_Error('order_not_found', 'Order not found in customer orders');
+    }
+
+    /**
+     * Turn a product reference (ID string or object) into an array with id + name.
+     * Names come from the saved product list first, then the API.
+     */
+    private function normalize_product($api_key, $product) {
+        if (is_array($product)) {
+            return $product;
+        }
+
+        $product_id = strval($product);
+        $settings = get_option($this->option_name);
+        if (!empty($settings['products']) && is_array($settings['products'])) {
+            foreach ($settings['products'] as $saved) {
+                if (isset($saved['id']) && $saved['id'] === $product_id) {
+                    return array('id' => $product_id, 'name' => isset($saved['name']) ? $saved['name'] : '');
+                }
+            }
+        }
+
+        $data = $this->api_get($api_key, '/v1/products/' . rawurlencode($product_id));
+        if (!is_wp_error($data) && isset($data['id'])) {
+            return $data;
+        }
+
+        return array('id' => $product_id, 'name' => '');
+    }
+
+    /**
+     * Whether a transaction is a full refund or chargeback that should revoke access.
+     * The API spec lists "chargedBack" while webhook examples show "chargeback", so both
+     * are accepted. Partial refunds ("partialRefund") keep access.
+     */
+    private function is_full_refund($sale) {
+        $status = isset($sale['status']) ? $sale['status'] : '';
+
+        if (in_array($status, array('chargedBack', 'chargeback'), true)) {
+            return true;
+        }
+        if ($status === 'partialRefund') {
+            return false;
+        }
+
+        $refunded_amount = isset($sale['refunded_amount']) ? floatval($sale['refunded_amount']) : 0;
+        $amount_paid = isset($sale['amount_paid']) ? floatval($sale['amount_paid']) : 0;
+
+        if ($status === 'refunded') {
+            // Guard against a partial refund reported as "refunded"
+            return !($refunded_amount > 0 && $amount_paid > 0 && $refunded_amount < $amount_paid);
+        }
+
+        return $refunded_amount > 0 && $amount_paid > 0 && $refunded_amount >= $amount_paid;
+    }
+
+    /**
+     * Whether a date string (ISO 8601) is in the past. Empty or invalid dates return false
+     * so access is never removed based on missing data.
+     */
+    private function date_has_passed($date) {
+        if (empty($date) || !is_string($date)) {
+            return false;
+        }
+        $timestamp = strtotime($date);
+        return $timestamp !== false && $timestamp <= time();
+    }
+
+    /**
+     * Sale IDs already processed for a user (renewals, earlier purchases)
+     */
+    private function get_processed_sale_ids($user_id) {
+        $ids = json_decode((string) get_user_meta($user_id, 'creem_processed_sale_ids', true), true);
+        return is_array($ids) ? $ids : array();
+    }
+
+    private function add_processed_sale_id($user_id, $sale_id) {
+        $ids = $this->get_processed_sale_ids($user_id);
+        if (!in_array($sale_id, $ids, true)) {
+            $ids[] = $sale_id;
+            update_user_meta($user_id, 'creem_processed_sale_ids', json_encode(array_slice($ids, -200)));
+        }
+    }
+
+    /**
+     * Resolve customer (with email) and product for a transaction.
+     * Subscription transactions use the subscription; one-time payments use the
+     * customer and order lookups.
+     *
+     * @return array{sale:array, subscription:array|null, email:string}
+     */
+    private function resolve_sale_context($api_key, $sale) {
+        $subscription = null;
+        $subscription_id = $this->extract_subscription_id($sale);
+
+        if (!empty($subscription_id)) {
+            $fetched = $this->fetch_subscription($api_key, $subscription_id);
+            if (!is_wp_error($fetched)) {
+                $subscription = $fetched;
+            }
+        }
+
+        // Customer: transaction has an ID string; the subscription has the full object
+        if (!isset($sale['customer']['email'])) {
+            if ($subscription && isset($subscription['customer']['email'])) {
+                $sale['customer'] = $subscription['customer'];
+            } else {
+                // Either may be a plain ID string
+                $customer_id = '';
+                if (!empty($sale['customer']) && is_string($sale['customer'])) {
+                    $customer_id = $sale['customer'];
+                } elseif ($subscription && !empty($subscription['customer']) && is_string($subscription['customer'])) {
+                    $customer_id = $subscription['customer'];
+                }
+                $customer = $this->fetch_customer($api_key, $customer_id);
+                if (!is_wp_error($customer)) {
+                    $sale['customer'] = $customer;
+                }
+            }
+        }
+
+        // Product: transactions have none; use the subscription, else the order
+        if (empty($sale['product'])) {
+            if ($subscription && !empty($subscription['product'])) {
+                $sale['product'] = $this->normalize_product($api_key, $subscription['product']);
+            } elseif (!empty($sale['order']) && isset($sale['customer']['id'])) {
+                $product = $this->fetch_order_product($api_key, $sale['customer']['id'], $sale['order']);
+                if (!is_wp_error($product)) {
+                    $sale['product'] = $product;
+                }
+            }
+        } elseif (is_string($sale['product'])) {
+            $sale['product'] = $this->normalize_product($api_key, $sale['product']);
+        }
+
+        $email = isset($sale['customer']['email']) ? sanitize_email($sale['customer']['email']) : '';
+
+        return array('sale' => $sale, 'subscription' => $subscription, 'email' => $email);
     }
 
     /**
@@ -483,33 +645,27 @@ class Creem_API_WordPress {
             return 'Invalid API response format';
         }
 
+        $trace = isset($json_data['trace_id']) ? ' (trace_id: ' . $json_data['trace_id'] . ')' : '';
+
+        // Creem returns 'message' as an array of strings; it is more specific than 'error'
+        if (isset($json_data['message'])) {
+            $message = is_array($json_data['message'])
+                ? implode('; ', array_map('strval', $json_data['message']))
+                : strval($json_data['message']);
+            return $message . $trace;
+        }
+
         // Check for 'error' field (can be string or object)
         if (isset($json_data['error'])) {
             if (is_string($json_data['error'])) {
-                return $json_data['error'];
+                return $json_data['error'] . $trace;
             }
             if (is_array($json_data['error'])) {
                 if (isset($json_data['error']['message'])) {
-                    return $json_data['error']['message'];
+                    return strval($json_data['error']['message']);
                 }
-                // Return the whole error array as JSON string
                 return json_encode($json_data['error']);
             }
-        }
-
-        // Check for 'message' field
-        if (isset($json_data['message'])) {
-            return $json_data['message'];
-        }
-
-        // Check for 'detail' field (some APIs use this)
-        if (isset($json_data['detail'])) {
-            return $json_data['detail'];
-        }
-
-        // If we have the whole response, try to extract useful info
-        if (isset($json_data['status']) && isset($json_data['title'])) {
-            return $json_data['title'] . ' (Status: ' . $json_data['status'] . ')';
         }
 
         return 'Unknown API error - check logs for details';
@@ -590,127 +746,139 @@ class Creem_API_WordPress {
                 return;
             }
 
-            $page_transactions = $this->parse_creem_transactions($data);
+            $page_transactions = $data['items'];
             $transactions = array_merge($transactions, $page_transactions);
 
             // Stop if we have enough or there are no more pages
             $has_next_page = !empty($data['pagination']['next_page']);
             $page_number++;
 
-        } while ($has_next_page && count($transactions) < $sales_limit);
+        } while ($has_next_page && count($transactions) < $sales_limit && $page_number <= 20);
 
-        // Log first transaction for debugging
         if (!empty($transactions)) {
             $this->log_activity('RAW TRANSACTION FROM API', array(
                 'raw_transaction' => $transactions[0],
-                'total_fetched' => count($transactions),
-                'IMPORTANT' => 'This is the COMPLETE unmodified transaction data from Creem.io'
+                'total_fetched' => count($transactions)
             ));
-        }
 
-        if (!empty($transactions)) {
             $new_sales_count = 0;
             $refunds_processed = 0;
             $subscriptions_updated = 0;
+            $skipped = 0;
+
+            // Sales skipped because auto-create was off for their product (sale_id => product_id)
+            $skipped_sales = get_option('creem_skipped_sale_ids', array());
+            $skipped_sales = is_array($skipped_sales) ? $skipped_sales : array();
+            $auto_create = isset($settings['product_auto_create']) && is_array($settings['product_auto_create']) ? $settings['product_auto_create'] : array();
+
+            // Oldest first, so the newest sale is the one left stored on the user
+            usort($transactions, function ($a, $b) {
+                return (isset($a['created_at']) ? $a['created_at'] : 0) <=> (isset($b['created_at']) ? $b['created_at'] : 0);
+            });
 
             foreach ($transactions as $sale) {
                 $sale_id = isset($sale['id']) ? $sale['id'] : '';
+                $is_full_refund = $this->is_full_refund($sale);
 
-                // Creem.io uses simple JSON structure, no attributes wrapper
-                $customer_email = '';
-                if (isset($sale['customer'])) {
-                    // Customer might be ID string or object
-                    if (is_string($sale['customer'])) {
-                        // TODO: Fetch customer details if needed
-                        $customer_email = '';
-                    } else if (is_array($sale['customer']) && isset($sale['customer']['email'])) {
-                        $customer_email = sanitize_email($sale['customer']['email']);
+                // Only paid or refunded transactions matter; pending/declined/void never grant access
+                $status = isset($sale['status']) ? $sale['status'] : '';
+                // ("refunded" that isn't a full refund is a partial refund reported as refunded)
+                if (!$is_full_refund && !in_array($status, array('paid', 'partialRefund', 'refunded', ''), true)) {
+                    continue;
+                }
+
+                // Already handled, or skipped because auto-create is off for its product:
+                // skip before any API lookup. Refunds always go through.
+                if (!$is_full_refund && !empty($sale_id)) {
+                    if ($this->is_event_processed('creem_done_sale_ids', $sale_id)) {
+                        continue;
+                    }
+                    $skipped_product = isset($skipped_sales[$sale_id]) ? $skipped_sales[$sale_id] : '';
+                    if ($skipped_product !== '' && empty($auto_create[$skipped_product])) {
+                        continue;
                     }
                 }
-                $email = $customer_email;
 
-                // Handle refunds - check for refunded_amount in Creem.io transaction
-                if (isset($settings['handle_refunds']) && $settings['handle_refunds']) {
-                    // In Creem.io, check if refunded_amount > 0
-                    $refunded_amount = isset($sale['refunded_amount']) ? floatval($sale['refunded_amount']) : 0;
-                    if ($refunded_amount > 0) {
+                // Transactions only carry customer/product IDs: resolve email and product.
+                // This runs regardless of the "Handle Subscriptions" setting.
+                $context = $this->resolve_sale_context($access_token, $sale);
+                $sale = $context['sale'];
+                $subscription = $context['subscription'];
+                $email = $context['email'];
+
+                if (empty($email)) {
+                    $this->log_activity('Transaction skipped - customer email not resolved', array(
+                        'sale_id' => $sale_id,
+                        'customer' => isset($sale['customer']) && is_string($sale['customer']) ? $sale['customer'] : '',
+                        'note' => 'Will retry on the next cron run'
+                    ));
+                    $skipped++;
+                    continue;
+                }
+
+                // Full refund / chargeback: revoke if enabled, and never process as a new sale
+                if ($is_full_refund) {
+                    if (!empty($settings['handle_refunds'])) {
                         $refund_result = $this->handle_refund($sale);
-                        if (!is_wp_error($refund_result)) {
+                        if (!is_wp_error($refund_result) && $refund_result) {
                             $refunds_processed++;
+                        }
+                    }
+                    continue;
+                }
+
+                if ($status === 'partialRefund') {
+                    $existing_user = get_user_by('email', $email);
+                    if (!$existing_user || !in_array($sale_id, $this->get_processed_sale_ids($existing_user->ID), true)) {
+                        $this->log_activity('Partial refund - access kept', array(
+                            'sale_id' => $sale_id,
+                            'email' => $email,
+                            'refunded_amount' => isset($sale['refunded_amount']) ? $sale['refunded_amount'] : 0
+                        ));
+                    }
+                }
+
+                // Ended subscription whose paid period is over: revoke access
+                if (!empty($settings['handle_subscriptions']) && $subscription) {
+                    $sub_status = isset($subscription['status']) ? $subscription['status'] : '';
+                    $period_end = isset($subscription['current_period_end_date']) ? $subscription['current_period_end_date'] : '';
+                    if (in_array($sub_status, self::$ENDED_STATUSES, true) && $this->date_has_passed($period_end)) {
+                        $sub_result = $this->handle_subscription_change($sale, $subscription);
+                        if (!is_wp_error($sub_result) && $sub_result) {
+                            $subscriptions_updated++;
                         }
                         continue;
                     }
                 }
 
-                // Handle subscription status changes - fetch actual subscription data
-                if (isset($settings['handle_subscriptions']) && $settings['handle_subscriptions']) {
-                    // Extract subscription ID (pass api_key)
-                    $subscription_id = $this->extract_subscription_id($sale, $access_token);
-
-                    if (!empty($subscription_id)) {
-                        // Fetch the actual subscription to check its status
-                        $subscription = $this->fetch_subscription($access_token, $subscription_id);
-
-                        if ($subscription && !is_wp_error($subscription)) {
-                            // Creem.io subscription status
-                            $sub_status = isset($subscription['status']) ? $subscription['status'] : '';
-
-                            // Check for subscription states that require action
-                            // canceled = subscription ended
-                            // past_due = payment failed
-                            if (in_array($sub_status, array('canceled', 'past_due'))) {
-                                $sub_result = $this->handle_subscription_change($sale, $subscription);
-                                if (!is_wp_error($sub_result)) {
-                                    $subscriptions_updated++;
-                                }
-                                continue;
-                            } else if ($sub_status === 'scheduled_cancel') {
-                                // scheduled_cancel in Creem means it will cancel at period end
-                                $current_period_end = isset($subscription['current_period_end_date']) ? $subscription['current_period_end_date'] : '';
-                                if (!empty($current_period_end) && strtotime($current_period_end) <= time()) {
-                                    // Period ended, treat as cancelled
-                                    $sub_result = $this->handle_subscription_change($sale, $subscription);
-                                    if (!is_wp_error($sub_result)) {
-                                        $subscriptions_updated++;
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
+                // Skip sales already processed for this user (latest sale or any earlier one)
+                $existing_user = get_user_by('email', $email);
+                if ($existing_user && !empty($sale_id)) {
+                    if ($sale_id === get_user_meta($existing_user->ID, 'creem_sale_id', true)
+                        || in_array($sale_id, $this->get_processed_sale_ids($existing_user->ID), true)) {
+                        $this->mark_event_processed('creem_done_sale_ids', $sale_id);
+                        continue;
                     }
                 }
 
-                // If transaction customer is a string ID, inject full customer from subscription
-                if (isset($sale['customer']) && is_string($sale['customer'])
-                    && isset($subscription) && is_array($subscription) && !is_wp_error($subscription)
-                    && isset($subscription['customer']) && is_array($subscription['customer'])) {
-                    $sale['customer'] = $subscription['customer'];
-                    $email = isset($subscription['customer']['email']) ? sanitize_email($subscription['customer']['email']) : $email;
+                $result = $this->process_sale($sale);
+                if (is_wp_error($result) && $result->get_error_code() === 'auto_create_disabled' && !empty($sale_id)) {
+                    // Remember it so it isn't looked up again until auto-create is turned on
+                    $skipped_sales[$sale_id] = isset($sale['product']['id']) ? strval($sale['product']['id']) : '';
+                    update_option('creem_skipped_sale_ids', array_slice($skipped_sales, -1000, null, true), false);
                 }
-
-                // If transaction doesn't have product but subscription does, inject product data from subscription
-                if (!isset($sale['product']) 
-                    && isset($subscription) && is_array($subscription) && !is_wp_error($subscription)
-                    && isset($subscription['product']) && is_array($subscription['product'])) {
-                    $sale['product'] = $subscription['product'];
-                }
-
-                // Reliable check: does a WP user with this email already have this exact sale_id recorded?
-                $should_process = true;
-                if (!empty($email) && !empty($sale_id)) {
-                    $existing_user = get_user_by('email', $email);
-                    if ($existing_user) {
-                        $stored_sale_id = get_user_meta($existing_user->ID, 'creem_sale_id', true);
-                        if ($stored_sale_id === $sale_id) {
-                            $should_process = false; // Already processed, user exists
-                        }
+                if (!is_wp_error($result)) {
+                    $new_sales_count++;
+                    if (!empty($sale_id)) {
+                        $this->add_processed_sale_id($result, $sale_id);
+                        $this->mark_event_processed('creem_done_sale_ids', $sale_id);
+                        unset($skipped_sales[$sale_id]);
                     }
-                }
-
-                if ($should_process) {
-                    $result = $this->process_sale($sale);
-                    if (!is_wp_error($result)) {
-                        $new_sales_count++;
+                    // A new payment on a live subscription clears any earlier "ended" state
+                    if ($subscription && isset($subscription['status']) && !in_array($subscription['status'], self::$ENDED_STATUSES, true)) {
+                        update_user_meta($result, 'creem_subscription_status', $subscription['status']);
+                        delete_user_meta($result, 'creem_subscription_ended_date');
+                        delete_user_meta($result, 'creem_subscription_ends_at');
                     }
                 }
             }
@@ -719,12 +887,15 @@ class Creem_API_WordPress {
                 'total_sales_checked' => count($transactions),
                 'new_sales_processed' => $new_sales_count,
                 'refunds_processed' => $refunds_processed,
-                'subscriptions_updated' => $subscriptions_updated
+                'subscriptions_updated' => $subscriptions_updated,
+                'skipped_unresolved' => $skipped
             ));
         }
 
         // Also check existing users' subscriptions for status changes
-        if (isset($settings['handle_subscriptions']) && $settings['handle_subscriptions']) {
+        if (!empty($settings['handle_subscriptions'])) {
+            // Fresh data for this phase, so a cancellation isn't masked by the cache
+            $this->api_cache = array();
             $subscriptions_checked = $this->check_existing_subscriptions($access_token);
             if ($subscriptions_checked > 0) {
                 $this->log_activity('Existing subscriptions checked', array(
@@ -743,15 +914,21 @@ class Creem_API_WordPress {
             return 0;
         }
 
-        $settings = get_option($this->option_name);
+        // Users with a Creem sale whose access hasn't been revoked yet.
+        // Rotates through all users, 50 per cron run.
+        $batch_size = 50;
+        $offset = max(0, intval(get_option('creem_existing_subs_offset', 0)));
 
-        // Get users with creem subscriptions who are still active (not marked as expired/past_due)
         $args = array(
             'meta_query' => array(
                 'relation' => 'AND',
                 array(
                     'key' => 'creem_sale_data',
                     'compare' => 'EXISTS'
+                ),
+                array(
+                    'key' => 'creem_refunded',
+                    'compare' => 'NOT EXISTS'
                 ),
                 array(
                     'relation' => 'OR',
@@ -761,71 +938,62 @@ class Creem_API_WordPress {
                     ),
                     array(
                         'key' => 'creem_subscription_status',
-                        'value' => array('expired', 'past_due'),
+                        'value' => self::$ENDED_STATUSES,
                         'compare' => 'NOT IN'
                     )
                 )
             ),
-            'number' => 50, // Check 50 users per cron run to avoid timeouts
-            'fields' => 'ids' // Only fetch user IDs for better performance
+            'number' => $batch_size,
+            'offset' => $offset,
+            'orderby' => 'ID',
+            'order' => 'ASC',
+            'fields' => 'ids'
         );
 
         $user_query = new WP_User_Query($args);
         $user_ids = $user_query->get_results();
+        update_option('creem_existing_subs_offset', count($user_ids) < $batch_size ? 0 : $offset + $batch_size, false);
+
         $checked_count = 0;
 
         foreach ($user_ids as $user_id) {
-            // Get stored sale data
-            $sale_data_json = get_user_meta($user_id, 'creem_sale_data', true);
-            if (empty($sale_data_json)) {
+            $sale_data = json_decode((string) get_user_meta($user_id, 'creem_sale_data', true), true);
+            if (!is_array($sale_data)) {
                 continue;
             }
 
-            $sale_data = json_decode($sale_data_json, true);
-            if (!$sale_data) {
-                continue;
-            }
-
-            // Extract subscription ID (pass access_token to fetch from links if needed)
-            $subscription_id = $this->extract_subscription_id($sale_data, $access_token);
+            $subscription_id = $this->extract_subscription_id($sale_data);
             if (empty($subscription_id)) {
-                continue; // Not a subscription purchase
+                continue; // One-time purchase
             }
 
-            // Fetch current subscription status
             $subscription = $this->fetch_subscription($access_token, $subscription_id);
-            if (!$subscription || is_wp_error($subscription)) {
+            if (is_wp_error($subscription)) {
                 continue;
             }
-
-            // Creem.io uses flat JSON structure — no 'attributes' wrapper
-            $sub_status = isset($subscription['status']) ? $subscription['status'] : '';
-            $ends_at = isset($subscription['current_period_end_date']) ? $subscription['current_period_end_date'] : '';
 
             $checked_count++;
 
-            // Check if subscription needs action
-            if (in_array($sub_status, array('expired', 'past_due'))) {
-                // Subscription has ended, remove roles
-                $result = $this->handle_subscription_change($sale_data, $subscription);
-                if (!is_wp_error($result)) {
+            $sub_status = isset($subscription['status']) ? $subscription['status'] : '';
+            $period_end = isset($subscription['current_period_end_date']) ? $subscription['current_period_end_date'] : '';
+
+            if (in_array($sub_status, self::$ENDED_STATUSES, true) && $this->date_has_passed($period_end)) {
+                // Make sure the stored sale has the customer email for handle_subscription_change
+                if (!isset($sale_data['customer']['email'])) {
                     $user = get_userdata($user_id);
+                    $sale_data['customer'] = isset($subscription['customer']['email'])
+                        ? $subscription['customer']
+                        : array('email' => $user ? $user->user_email : '');
+                }
+
+                $result = $this->handle_subscription_change($sale_data, $subscription);
+                if (!is_wp_error($result) && $result) {
                     $this->log_activity('Subscription auto-detected as ended', array(
                         'user_id' => $user_id,
-                        'email' => $user ? $user->user_email : 'unknown',
+                        'email' => $sale_data['customer']['email'],
                         'subscription_id' => $subscription_id,
-                        'status' => $sub_status
-                    ));
-                }
-            } else if ($sub_status === 'cancelled' && !empty($ends_at) && strtotime($ends_at) <= time()) {
-                // Cancelled subscription, grace period ended
-                $result = $this->handle_subscription_change($sale_data, $subscription);
-                if (!is_wp_error($result)) {
-                    $this->log_activity('Cancelled subscription grace period ended', array(
-                        'user_id' => $user->ID,
-                        'email' => $user->user_email,
-                        'subscription_id' => $subscription_id,
-                        'ends_at' => $ends_at
+                        'status' => $sub_status,
+                        'period_end' => $period_end
                     ));
                 }
             }
@@ -833,7 +1001,7 @@ class Creem_API_WordPress {
 
         return $checked_count;
     }
-    
+
     /**
      * Process a sale and create/update user
      */
@@ -900,7 +1068,7 @@ class Creem_API_WordPress {
 
         // Determine roles for this product
         $roles = array();
-        if (!empty($product_id) && isset($product_roles[$product_id]) && !empty($product_roles[$product_id])) {
+        if (!empty($product_id) && isset($product_roles[$product_id]) && is_array($product_roles[$product_id]) && !empty($product_roles[$product_id])) {
             $roles = $product_roles[$product_id];
         } else {
             $roles = $default_roles;
@@ -929,6 +1097,9 @@ class Creem_API_WordPress {
             }
 
             $user = get_user_by('id', $user_id);
+            if (!$user) {
+                return new WP_Error('user_not_found', 'User could not be loaded after creation');
+            }
 
             // Set first name from email
             $first_name = $this->get_first_name_from_email($email);
@@ -968,6 +1139,9 @@ class Creem_API_WordPress {
             $email_sent = false;
             if (isset($settings['send_welcome_email']) && $settings['send_welcome_email']) {
                 $email_sent = $this->send_welcome_email($user, $password, $product_name);
+            } else {
+                // wp_create_user() sends nothing, so send WordPress's "set your password" email
+                wp_new_user_notification($user_id, null, 'user');
             }
             
             update_user_meta($user_id, 'creem_email_sent', $email_sent ? 'yes' : 'no');
@@ -987,7 +1161,7 @@ class Creem_API_WordPress {
             
             return $user_id;
         } else {
-            // Update existing user roles if needed
+            // Existing user: add missing roles and keep sale meta current (renewals, repurchases)
             $roles_added = array();
             foreach ($roles as $role) {
                 if (!in_array($role, (array) $user->roles)) {
@@ -995,43 +1169,69 @@ class Creem_API_WordPress {
                     $roles_added[] = $role;
                 }
             }
-            
-            if (!empty($roles_added)) {
-                // Update creem metadata for existing user
-                $sale_id = isset($sale_data['id']) ? $sale_data['id'] : '';
+
+            // Only roles this plugin granted are recorded, so roles the user already
+            // had are never removed on refund or subscription end.
+            $assigned_roles = json_decode((string) get_user_meta($user->ID, 'creem_assigned_roles', true), true);
+            $assigned_roles = is_array($assigned_roles) ? $assigned_roles : array();
+            $assigned_roles = array_values(array_unique(array_merge($assigned_roles, $roles_added)));
+
+            $is_first_creem_sale = !get_user_meta($user->ID, 'creem_sale_id', true);
+            update_user_meta($user->ID, 'creem_assigned_roles', json_encode($assigned_roles));
+
+            // An older sale (e.g. a past renewal seen for the first time) must not replace
+            // the newer sale the user is tracked by
+            $stored_sale = json_decode((string) get_user_meta($user->ID, 'creem_sale_data', true), true);
+            $stored_created = is_array($stored_sale) && isset($stored_sale['created_at']) ? $stored_sale['created_at'] : 0;
+            $this_created = isset($sale_data['created_at']) ? $sale_data['created_at'] : 0;
+            $is_latest_sale = $is_first_creem_sale || !$stored_created || !$this_created || $this_created >= $stored_created;
+
+            if ($is_latest_sale) {
+                update_user_meta($user->ID, 'creem_sale_id', $sale_id);
+                update_user_meta($user->ID, 'creem_sale_data', json_encode($sale_data));
+                update_user_meta($user->ID, 'creem_product_name', $product_name);
+                update_user_meta($user->ID, 'creem_product_id', $product_id);
                 update_user_meta($user->ID, 'creem_last_purchase_date', current_time('mysql'));
                 update_user_meta($user->ID, 'creem_last_product_name', $product_name);
                 update_user_meta($user->ID, 'creem_last_product_id', $product_id);
                 update_user_meta($user->ID, 'creem_last_sale_id', $sale_id);
-                
-                // Append to purchase history
-                $purchase_history = get_user_meta($user->ID, 'creem_purchase_history', true);
-                if (!$purchase_history) {
-                    $purchase_history = array();
-                } else {
-                    $purchase_history = json_decode($purchase_history, true);
-                }
-                $purchase_history[] = array(
-                    'date' => current_time('mysql'),
-                    'product_name' => $product_name,
-                    'product_id' => $product_id,
-                    'sale_id' => $sale_id,
-                    'roles_added' => $roles_added
-                );
-                update_user_meta($user->ID, 'creem_purchase_history', json_encode($purchase_history));
-                
-                $this->log_activity('User roles updated', array(
-                    'user_id' => $user->ID,
-                    'email' => $email,
-                    'username' => $user->user_login,
-                    'product_name' => $product_name,
-                    'product_id' => $product_id,
-                    'sale_id' => $sale_id,
-                    'roles_added' => $roles_added,
-                    'all_roles' => $user->roles
-                ));
             }
-            
+            if ($is_first_creem_sale) {
+                update_user_meta($user->ID, 'creem_created_date', current_time('mysql'));
+            }
+            if (!empty($sale_data['customer']['id'])) {
+                update_user_meta($user->ID, 'creem_customer_id', $sale_data['customer']['id']);
+            }
+
+            // A new purchase after a refund restores normal tracking
+            if (get_user_meta($user->ID, 'creem_refunded', true) && get_user_meta($user->ID, 'creem_refunded', true) !== $sale_id) {
+                delete_user_meta($user->ID, 'creem_refunded');
+                delete_user_meta($user->ID, 'creem_refunded_date');
+            }
+
+            // Append to purchase history (most recent 100)
+            $purchase_history = json_decode((string) get_user_meta($user->ID, 'creem_purchase_history', true), true);
+            $purchase_history = is_array($purchase_history) ? $purchase_history : array();
+            $purchase_history[] = array(
+                'date' => current_time('mysql'),
+                'product_name' => $product_name,
+                'product_id' => $product_id,
+                'sale_id' => $sale_id,
+                'roles_added' => $roles_added
+            );
+            update_user_meta($user->ID, 'creem_purchase_history', json_encode(array_slice($purchase_history, -100)));
+
+            $this->log_activity(empty($roles_added) ? 'Sale recorded for existing user' : 'User roles updated', array(
+                'user_id' => $user->ID,
+                'email' => $email,
+                'username' => $user->user_login,
+                'product_name' => $product_name,
+                'product_id' => $product_id,
+                'sale_id' => $sale_id,
+                'roles_added' => $roles_added,
+                'all_roles' => array_values($user->roles)
+            ));
+
             return $user->ID;
         }
     }
@@ -1061,7 +1261,8 @@ class Creem_API_WordPress {
      * Takes the part before @ and capitalizes it
      */
     private function get_first_name_from_email($email) {
-        $local_part = substr($email, 0, strpos($email, '@'));
+        $at = strpos($email, '@');
+        $local_part = $at === false ? $email : substr($email, 0, $at);
 
         // Remove dots, underscores, and numbers to clean it up
         $clean_name = str_replace(array('.', '_', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'), ' ', $local_part);
@@ -1088,7 +1289,9 @@ class Creem_API_WordPress {
         $email_subject = isset($settings['email_subject']) ? $settings['email_subject'] : 'Welcome to {{site_name}}!';
         
         $reset_key = get_password_reset_key($user);
-        $password_reset_url = network_site_url("wp-login.php?action=rp&key=$reset_key&login=" . rawurlencode($user->user_login), 'login');
+        $password_reset_url = is_wp_error($reset_key)
+            ? wp_lostpassword_url()
+            : network_site_url("wp-login.php?action=rp&key=$reset_key&login=" . rawurlencode($user->user_login), 'login');
         
         // Dynamic tags
         $tags = array(
@@ -1142,9 +1345,10 @@ class Creem_API_WordPress {
      */
     private function log_activity($type, $data) {
         $logs = get_option($this->log_option_name, array());
+        $logs = is_array($logs) ? $logs : array();
         $settings = get_option($this->option_name);
-        $log_limit = isset($settings['log_limit']) ? intval($settings['log_limit']) : 500;
-        $log_rotation_days = isset($settings['log_rotation_days']) ? intval($settings['log_rotation_days']) : 30;
+        $log_limit = isset($settings['log_limit']) ? max(50, intval($settings['log_limit'])) : 500;
+        $log_rotation_days = isset($settings['log_rotation_days']) ? max(1, intval($settings['log_rotation_days'])) : 30;
         
         $log_entry = array(
             'timestamp' => current_time('mysql'),
@@ -1155,7 +1359,8 @@ class Creem_API_WordPress {
         array_unshift($logs, $log_entry);
         
         // Log rotation by date - remove logs older than specified days
-        $cutoff_date = date('Y-m-d H:i:s', strtotime("-{$log_rotation_days} days"));
+        // Same clock as the timestamps (site time), not server time
+        $cutoff_date = date('Y-m-d H:i:s', current_time('timestamp') - $log_rotation_days * DAY_IN_SECONDS);
         $logs = array_filter($logs, function($log) use ($cutoff_date) {
             return isset($log['timestamp']) && $log['timestamp'] >= $cutoff_date;
         });
@@ -1165,38 +1370,71 @@ class Creem_API_WordPress {
             $logs = array_slice($logs, 0, $log_limit);
         }
         
-        update_option($this->log_option_name, array_values($logs));
+        // Not autoloaded: the log can be large and is only needed on the plugin's admin pages
+        update_option($this->log_option_name, array_values($logs), false);
     }
     
     /**
-     * Handle refund
+     * Global list of processed event keys (refunds, subscription ends). Survives
+     * account deletion, unlike user meta.
+     */
+    private function is_event_processed($option, $key) {
+        $keys = get_option($option, array());
+        return is_array($keys) && in_array($key, $keys, true);
+    }
+
+    private function mark_event_processed($option, $key) {
+        $keys = get_option($option, array());
+        $keys = is_array($keys) ? $keys : array();
+        if (!in_array($key, $keys, true)) {
+            $keys[] = $key;
+            update_option($option, array_slice($keys, -1000), false);
+        }
+    }
+
+    /**
+     * Remove the roles this plugin granted to a user
+     */
+    private function remove_assigned_roles($user) {
+        $roles = json_decode((string) get_user_meta($user->ID, 'creem_assigned_roles', true), true);
+        $roles_removed = array();
+        if (is_array($roles)) {
+            foreach ($roles as $role) {
+                if (in_array($role, (array) $user->roles, true)) {
+                    $user->remove_role($role);
+                    $roles_removed[] = $role;
+                }
+            }
+        }
+        return $roles_removed;
+    }
+
+    /**
+     * Handle a full refund or chargeback
+     *
+     * @return int|WP_Error User ID when handled, 0 when already handled
      */
     private function handle_refund($sale_data) {
         $settings = get_option($this->option_name);
 
-        // Creem.io simple JSON structure
         $sale_id = isset($sale_data['id']) ? $sale_data['id'] : '';
-        
-        $email = '';
-        if (isset($sale_data['customer'])) {
-            if (is_array($sale_data['customer']) && isset($sale_data['customer']['email'])) {
-                $email = sanitize_email($sale_data['customer']['email']);
-            }
-        }
-        
-        $product_name = '';
-        if (isset($sale_data['product']) && is_array($sale_data['product'])) {
-            $product_name = isset($sale_data['product']['name']) ? sanitize_text_field($sale_data['product']['name']) : '';
-        }
-        
+        $email = isset($sale_data['customer']['email']) ? sanitize_email($sale_data['customer']['email']) : '';
+        $product_name = isset($sale_data['product']['name']) ? sanitize_text_field($sale_data['product']['name']) : '';
         $refunded_amount = isset($sale_data['refunded_amount']) ? $sale_data['refunded_amount'] : 0;
+        $status = isset($sale_data['status']) ? $sale_data['status'] : '';
 
         if (empty($email)) {
             return new WP_Error('invalid_email', 'Email address is required');
         }
 
+        // Each refunded sale is handled once, so an old refund never revokes a later purchase
+        if (!empty($sale_id) && $this->is_event_processed('creem_processed_refund_ids', $sale_id)) {
+            return 0;
+        }
+
         $user = get_user_by('email', $email);
         if (!$user) {
+            $this->mark_event_processed('creem_processed_refund_ids', $sale_id);
             $this->log_activity('Refund processing skipped', array(
                 'reason' => 'User not found',
                 'email' => $email,
@@ -1206,81 +1444,74 @@ class Creem_API_WordPress {
         }
 
         $refund_action = isset($settings['refund_action']) ? $settings['refund_action'] : 'remove_roles';
+        $user_id = $user->ID;
 
         if ($refund_action === 'delete_account') {
-            require_once(ABSPATH.'wp-admin/includes/user.php');
-            wp_delete_user($user->ID);
+            require_once(ABSPATH . 'wp-admin/includes/user.php');
+            wp_delete_user($user_id);
 
             $this->log_activity('User deleted due to refund', array(
-                'user_id' => $user->ID,
+                'user_id' => $user_id,
                 'email' => $email,
                 'sale_id' => $sale_id,
                 'product' => $product_name,
-                'refunded_at' => current_time('mysql')
+                'status' => $status,
+                'refunded_amount' => $refunded_amount
             ));
         } else {
-            // Remove roles assigned by creem
-            $assigned_roles = get_user_meta($user->ID, 'creem_assigned_roles', true);
-            $roles_removed = array();
-            if ($assigned_roles) {
-                $roles = json_decode($assigned_roles, true);
-                if (is_array($roles)) {
-                    foreach ($roles as $role) {
-                        $user->remove_role($role);
-                        $roles_removed[] = $role;
-                    }
-                }
-            }
+            $roles_removed = $this->remove_assigned_roles($user);
 
-            update_user_meta($user->ID, 'creem_refunded', 'yes');
-            update_user_meta($user->ID, 'creem_refunded_date', current_time('mysql'));
+            update_user_meta($user_id, 'creem_refunded', $sale_id);
+            update_user_meta($user_id, 'creem_refunded_date', current_time('mysql'));
 
             $this->log_activity('User roles removed due to refund', array(
-                'user_id' => $user->ID,
+                'user_id' => $user_id,
                 'email' => $email,
                 'sale_id' => $sale_id,
                 'product' => $product_name,
-                'refunded_at' => current_time('mysql'),
+                'status' => $status,
+                'refunded_amount' => $refunded_amount,
                 'roles_removed' => $roles_removed
             ));
         }
 
-        return $user->ID;
+        $this->mark_event_processed('creem_processed_refund_ids', $sale_id);
+        update_option('creem_refund_count', intval(get_option('creem_refund_count', 0)) + 1, false);
+
+        return $user_id;
     }
-    
+
     /**
-     * Handle subscription change (cancellation/end/expiration)
+     * Handle subscription end (canceled/unpaid after the paid period)
      *
-     * @param array $transaction_data The transaction data from Creem.io API
+     * @param array $transaction_data The transaction data (with resolved customer)
      * @param array $subscription_data The subscription data from Creem.io API
+     * @return int|WP_Error User ID when handled, 0 when already handled
      */
     private function handle_subscription_change($transaction_data, $subscription_data) {
         $settings = get_option($this->option_name);
 
-        // Extract from transaction (Creem.io simple JSON)
-        $email = '';
-        $product_name = '';
-        
-        if (isset($transaction_data['customer']) && is_array($transaction_data['customer'])) {
-            $email = isset($transaction_data['customer']['email']) ? sanitize_email($transaction_data['customer']['email']) : '';
-        }
-        
-        if (isset($transaction_data['product']) && is_array($transaction_data['product'])) {
-            $product_name = isset($transaction_data['product']['name']) ? sanitize_text_field($transaction_data['product']['name']) : '';
-        }
+        $email = isset($transaction_data['customer']['email']) ? sanitize_email($transaction_data['customer']['email']) : '';
+        $product_name = isset($transaction_data['product']['name']) ? sanitize_text_field($transaction_data['product']['name']) : '';
 
-        // Extract from subscription (Creem.io simple JSON)
         $subscription_id = isset($subscription_data['id']) ? $subscription_data['id'] : '';
         $sub_status = isset($subscription_data['status']) ? $subscription_data['status'] : '';
-        $current_period_end = isset($subscription_data['current_period_end_date']) ? $subscription_data['current_period_end_date'] : '';
+        $ends_at = isset($subscription_data['current_period_end_date']) ? $subscription_data['current_period_end_date'] : '';
         $canceled_at = isset($subscription_data['canceled_at']) ? $subscription_data['canceled_at'] : '';
 
         if (empty($email)) {
             return new WP_Error('invalid_email', 'Email address is required');
         }
 
+        // Keyed by period end, so a subscription that is renewed and ends again is handled again
+        $event_key = $subscription_id . '|' . $ends_at;
+        if ($this->is_event_processed('creem_processed_sub_end_ids', $event_key)) {
+            return 0;
+        }
+
         $user = get_user_by('email', $email);
         if (!$user) {
+            $this->mark_event_processed('creem_processed_sub_end_ids', $event_key);
             $this->log_activity('Subscription change processing skipped', array(
                 'reason' => 'User not found',
                 'email' => $email,
@@ -1290,57 +1521,58 @@ class Creem_API_WordPress {
             return new WP_Error('user_not_found', 'User not found');
         }
 
+        // Only act on the subscription the user is currently tracked by. An old ended
+        // subscription must not revoke access granted by a newer purchase.
+        $stored_sale = json_decode((string) get_user_meta($user->ID, 'creem_sale_data', true), true);
+        $stored_subscription_id = is_array($stored_sale) ? $this->extract_subscription_id($stored_sale) : '';
+        if (!empty($stored_subscription_id) && $stored_subscription_id !== $subscription_id) {
+            $this->mark_event_processed('creem_processed_sub_end_ids', $event_key);
+            return 0;
+        }
+
         $action = isset($settings['subscription_cancellation_action']) ? $settings['subscription_cancellation_action'] : 'remove_roles';
+        $user_id = $user->ID;
 
         if ($action === 'delete_account') {
-            require_once(ABSPATH.'wp-admin/includes/user.php');
-            wp_delete_user($user->ID);
+            require_once(ABSPATH . 'wp-admin/includes/user.php');
+            wp_delete_user($user_id);
 
             $this->log_activity('User deleted due to subscription end', array(
-                'user_id' => $user->ID,
+                'user_id' => $user_id,
                 'email' => $email,
                 'subscription_id' => $subscription_id,
                 'subscription_status' => $sub_status,
                 'product' => $product_name,
-                'ends_at' => $current_period_end
+                'ends_at' => $ends_at,
+                'canceled_at' => $canceled_at
             ));
         } else {
-            // Remove roles assigned by creem
-            $assigned_roles = get_user_meta($user->ID, 'creem_assigned_roles', true);
-            $roles_removed = array();
-            if ($assigned_roles) {
-                $roles = json_decode($assigned_roles, true);
-                if (is_array($roles)) {
-                    foreach ($roles as $role) {
-                        $user->remove_role($role);
-                        $roles_removed[] = $role;
-                    }
-                }
-            }
+            $roles_removed = $this->remove_assigned_roles($user);
 
-            // Update subscription status in user meta
-            update_user_meta($user->ID, 'creem_subscription_status', $sub_status);
-            update_user_meta($user->ID, 'creem_subscription_ended_date', current_time('mysql'));
-            if (!empty($current_period_end)) {
-                update_user_meta($user->ID, 'creem_subscription_ends_at', $current_period_end);
+            update_user_meta($user_id, 'creem_subscription_status', $sub_status);
+            update_user_meta($user_id, 'creem_subscription_ended_date', current_time('mysql'));
+            if (!empty($ends_at)) {
+                update_user_meta($user_id, 'creem_subscription_ends_at', $ends_at);
             }
 
             $this->log_activity('Subscription ended - roles removed', array(
-                'user_id' => $user->ID,
+                'user_id' => $user_id,
                 'email' => $email,
                 'subscription_id' => $subscription_id,
                 'subscription_status' => $sub_status,
                 'product' => $product_name,
                 'action' => $action,
                 'roles_removed' => $roles_removed,
-                'ends_at' => $current_period_end,
+                'ends_at' => $ends_at,
                 'canceled_at' => $canceled_at
             ));
         }
 
-        return $user->ID;
+        $this->mark_event_processed('creem_processed_sub_end_ids', $event_key);
+
+        return $user_id;
     }
-    
+
     /**
      * Dashboard page
      */
@@ -1423,7 +1655,8 @@ class Creem_API_WordPress {
                 </div>
                 
                 <?php
-                $recent_logs = array_slice(get_option($this->log_option_name, array()), 0, 5);
+                $all_logs = get_option($this->log_option_name, array());
+                $recent_logs = is_array($all_logs) ? array_slice($all_logs, 0, 5) : array();
                 if (empty($recent_logs)) {
                     echo '<p>' . __('No recent activity.', 'snn') . '</p>';
                 } else {
@@ -1551,8 +1784,9 @@ class Creem_API_WordPress {
             $stats['top_product_count'] = (int) $product_results[0]->count;
         }
         
-        // Active subscriptions - using SQL query
-        // Count users with subscription_id in sale_data and status not 'cancelled'
+        // Active subscriptions: users whose stored sale has a subscription ID and
+        // whose access hasn't been revoked by a subscription end or refund
+        $ended_placeholders = implode(', ', array_fill(0, count(self::$ENDED_STATUSES), '%s'));
         $active_subs_query = $wpdb->prepare(
             "SELECT COUNT(DISTINCT um1.user_id) 
              FROM {$wpdb->usermeta} um1 
@@ -1560,23 +1794,29 @@ class Creem_API_WordPress {
              AND um1.meta_value LIKE %s
              AND um1.user_id NOT IN (
                  SELECT user_id FROM {$wpdb->usermeta} 
-                 WHERE meta_key = %s AND meta_value = %s
+                 WHERE meta_key = %s AND meta_value IN ({$ended_placeholders})
+             )
+             AND um1.user_id NOT IN (
+                 SELECT user_id FROM {$wpdb->usermeta} 
+                 WHERE meta_key = %s
              )",
-            'creem_sale_data',
-            '%subscription_id%',
-            'creem_subscription_status',
-            'cancelled'
+            array_merge(
+                array('creem_sale_data', '%' . $wpdb->esc_like('"subscription":"sub_') . '%', 'creem_subscription_status'),
+                self::$ENDED_STATUSES,
+                array('creem_refunded')
+            )
         );
         $stats['active_subscriptions'] = (int) $wpdb->get_var($active_subs_query);
         
         // Count from logs
         $logs = get_option($this->log_option_name, array());
+        $logs = is_array($logs) ? $logs : array();
         $refund_count = 0;
         $activity_24h = 0;
         $cutoff_24h = date('Y-m-d H:i:s', strtotime('-24 hours'));
         
         foreach ($logs as $log) {
-            if (isset($log['type']) && strpos(strtolower($log['type']), 'refund') !== false) {
+            if (isset($log['type']) && in_array($log['type'], array('User roles removed due to refund', 'User deleted due to refund'), true)) {
                 $refund_count++;
             }
             if (isset($log['timestamp']) && $log['timestamp'] >= $cutoff_24h) {
@@ -1587,14 +1827,12 @@ class Creem_API_WordPress {
             }
         }
         
-        $stats['total_refunds'] = $refund_count;
+        // Persistent counter (logs rotate), falling back to the log count for older installs
+        $stats['total_refunds'] = max(intval(get_option('creem_refund_count', 0)), $refund_count);
         $stats['activity_last_24h'] = $activity_24h;
         
-        // If no users, use processed sales count
-        if ($stats['total_sales'] === 0) {
-            $processed_sales = get_option('creem_processed_sales', array());
-            $stats['total_sales'] = count($processed_sales);
-        }
+        // Logs rotate, so never report fewer sales than Creem users
+        $stats['total_sales'] = max($stats['total_sales'], $stats['total_users']);
         
         return $stats;
     }
@@ -2093,14 +2331,6 @@ class Creem_API_WordPress {
     }
     
     /**
-     * Render product role row (deprecated, kept for compatibility)
-     */
-    private function render_product_role_row($product_id, $role) {
-        // This method is no longer used but kept for backward compatibility
-        return;
-    }
-    
-    /**
      * Save settings
      */
     private function save_settings($post_data) {
@@ -2110,14 +2340,15 @@ class Creem_API_WordPress {
         $settings = array(
             'access_token' => isset($post_data['access_token']) ? sanitize_text_field($post_data['access_token']) : '',
             'test_mode' => isset($post_data['test_mode']) ? true : false,
-            'default_roles' => isset($post_data['default_roles']) ? array_map('sanitize_text_field', $post_data['default_roles']) : array(),
-            'cron_interval' => isset($post_data['cron_interval']) ? intval($post_data['cron_interval']) : 120,
-            'sales_limit' => isset($post_data['sales_limit']) ? intval($post_data['sales_limit']) : 50,
+            'default_roles' => isset($post_data['default_roles']) && is_array($post_data['default_roles']) ? array_map('sanitize_text_field', $post_data['default_roles']) : array(),
+            'cron_interval' => isset($post_data['cron_interval']) ? max(30, intval($post_data['cron_interval'])) : 120,
+            'sales_limit' => isset($post_data['sales_limit']) ? max(1, intval($post_data['sales_limit'])) : 50,
             'send_welcome_email' => isset($post_data['send_welcome_email']) ? true : false,
             'email_subject' => isset($post_data['email_subject']) ? sanitize_text_field($post_data['email_subject']) : '',
             'email_template' => isset($post_data['email_template']) ? wp_kses_post($post_data['email_template']) : '',
-            'log_limit' => isset($post_data['log_limit']) ? intval($post_data['log_limit']) : 500,
-            'user_list_per_page' => isset($post_data['user_list_per_page']) ? intval($post_data['user_list_per_page']) : 20,
+            // These two are set on the Logs and User List pages, so keep their saved values
+            'log_limit' => isset($post_data['log_limit']) ? max(50, intval($post_data['log_limit'])) : (isset($existing_settings['log_limit']) ? $existing_settings['log_limit'] : 500),
+            'user_list_per_page' => isset($post_data['user_list_per_page']) ? max(1, intval($post_data['user_list_per_page'])) : (isset($existing_settings['user_list_per_page']) ? $existing_settings['user_list_per_page'] : 20),
             'product_roles' => array(),
             'product_auto_create' => array(),
             'products' => isset($existing_settings['products']) ? $existing_settings['products'] : array(),
@@ -2126,7 +2357,7 @@ class Creem_API_WordPress {
             'handle_subscriptions' => isset($post_data['handle_subscriptions']) ? true : false,
             'subscription_cancellation_action' => isset($post_data['subscription_cancellation_action']) ? sanitize_text_field($post_data['subscription_cancellation_action']) : 'remove_roles',
             'subscription_renewal_page' => isset($post_data['subscription_renewal_page']) ? intval($post_data['subscription_renewal_page']) : '',
-            'log_rotation_days' => isset($post_data['log_rotation_days']) ? intval($post_data['log_rotation_days']) : 30
+            'log_rotation_days' => isset($post_data['log_rotation_days']) ? max(1, intval($post_data['log_rotation_days'])) : 30
         );
 
         // Process product roles
@@ -2286,14 +2517,11 @@ class Creem_API_WordPress {
                 $all_products = array_merge($all_products, $products);
             }
 
-            // Check if there are more pages
-            $has_more_pages = false;
-            if (isset($data['pagination']) && isset($data['pagination']['next_page_number'])) {
-                $has_more_pages = !is_null($data['pagination']['next_page_number']);
-                $page_number = $data['pagination']['next_page_number'];
-            }
+            // Creem returns pagination.next_page (null on the last page)
+            $has_more_pages = !empty($data['pagination']['next_page']);
+            $page_number++;
 
-        } while ($has_more_pages);
+        } while ($has_more_pages && $page_number <= 20);
 
         // Log the fetch for debugging
         $this->log_activity('Products Fetched', array(
@@ -2322,6 +2550,7 @@ class Creem_API_WordPress {
         
         $settings = get_option($this->option_name);
         $logs = get_option($this->log_option_name, array());
+        $logs = is_array($logs) ? $logs : array();
         $per_page = 20;
         $page = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
         $total_logs = count($logs);
@@ -2666,7 +2895,7 @@ class Creem_API_WordPress {
                                             <tr><th><?php _e('Product Name', 'snn'); ?></th><td><?php echo esc_html($product_name ? $product_name : 'N/A'); ?></td></tr>
                                             <tr><th><?php _e('Product ID', 'snn'); ?></th><td><code><?php echo esc_html($product_id ? $product_id : 'N/A'); ?></code></td></tr>
                                             <tr><th><?php _e('Created Date', 'snn'); ?></th><td><?php echo esc_html($created_date ? $created_date : 'N/A'); ?></td></tr>
-                                            <tr><th><?php _e('Assigned Roles', 'snn'); ?></th><td><?php echo esc_html($assigned_roles ? implode(', ', json_decode($assigned_roles, true)) : 'N/A'); ?></td></tr>
+                                            <tr><th><?php _e('Assigned Roles', 'snn'); ?></th><td><?php $assigned_list = json_decode((string) $assigned_roles, true); echo esc_html(is_array($assigned_list) && $assigned_list ? implode(', ', $assigned_list) : 'N/A'); ?></td></tr>
                                         </table>
                                         
                                         <h3><?php _e('Email Status', 'snn'); ?></h3>
@@ -2835,6 +3064,9 @@ class Creem_API_WordPress {
                         <li><?php _e('creem_refunded_date - Refund date', 'snn'); ?></li>
                         <li><?php _e('creem_subscription_status - Subscription status', 'snn'); ?></li>
                         <li><?php _e('creem_subscription_ended_date - Subscription end date', 'snn'); ?></li>
+                        <li><?php _e('creem_subscription_ends_at - Subscription period end', 'snn'); ?></li>
+                        <li><?php _e('creem_customer_id - Creem customer ID', 'snn'); ?></li>
+                        <li><?php _e('creem_processed_sale_ids - Processed sale IDs', 'snn'); ?></li>
                     </ul>
                     
                     <p style="margin-top: 15px;"><strong><?php _e('Note:', 'snn'); ?></strong> <?php _e('WordPress user accounts will NOT be deleted, only the creem metadata will be removed.', 'snn'); ?></p>
@@ -2930,7 +3162,7 @@ class Creem_API_WordPress {
         
         // Count logs
         $logs = get_option($this->log_option_name, array());
-        $stats['logs_count'] = count($logs);
+        $stats['logs_count'] = is_array($logs) ? count($logs) : 0;
         
         // Count processed sales
         $processed_sales = get_option('creem_processed_sales', array());
@@ -3001,9 +3233,8 @@ class Creem_API_WordPress {
         }
         
         // 2. Remove scheduled cron jobs
-        $timestamp = wp_next_scheduled('creem_api_check_sales');
-        if ($timestamp) {
-            wp_unschedule_event($timestamp, 'creem_api_check_sales');
+        if (wp_next_scheduled('creem_api_check_sales')) {
+            wp_clear_scheduled_hook('creem_api_check_sales');
             $deleted_data[] = __('Cron Jobs', 'snn');
         }
         
@@ -3026,7 +3257,9 @@ class Creem_API_WordPress {
             'creem_refunded_date',
             'creem_subscription_status',
             'creem_subscription_ended_date',
-            'creem_customer_id'
+            'creem_subscription_ends_at',
+            'creem_customer_id',
+            'creem_processed_sale_ids'
         );
         
         $total_meta_deleted = 0;
@@ -3054,8 +3287,11 @@ class Creem_API_WordPress {
      * Check and redirect users with expired subscriptions to renewal page
      */
     public function check_subscription_renewal_redirect() {
-        // Don't run on admin pages
-        if (is_admin()) {
+        // Don't run on admin, AJAX, REST, cron or login/registration requests
+        if (is_admin() || wp_doing_ajax() || wp_doing_cron() || (defined('REST_REQUEST') && REST_REQUEST)) {
+            return;
+        }
+        if (isset($GLOBALS['pagenow']) && in_array($GLOBALS['pagenow'], array('wp-login.php', 'wp-register.php', 'wp-signup.php'), true)) {
             return;
         }
 
@@ -3103,7 +3339,7 @@ class Creem_API_WordPress {
         $subscription_status = get_user_meta($current_user->ID, 'creem_subscription_status', true);
 
         // If subscription is cancelled or ended, redirect to renewal page
-        if ($subscription_status === 'cancelled') {
+        if (in_array($subscription_status, self::$ENDED_STATUSES, true)) {
             // Check if user lost their roles (which means subscription was processed as ended)
             $assigned_roles = get_user_meta($current_user->ID, 'creem_assigned_roles', true);
             if ($assigned_roles) {
@@ -3119,21 +3355,15 @@ class Creem_API_WordPress {
                     }
 
                     // If user doesn't have any of their assigned roles, subscription has ended
-                    if (!$has_any_role) {
-                        // Get product information for logging
-                        $product_name = get_user_meta($current_user->ID, 'creem_product_name', true);
-
-                        $this->log_activity('Subscription renewal redirect', array(
-                            'user_id' => $current_user->ID,
-                            'email' => $current_user->user_email,
-                            'product' => $product_name,
-                            'subscription_status' => $subscription_status,
-                            'renewal_page_id' => $renewal_page_id
-                        ));
-
-                        // Redirect to renewal page
-                        wp_redirect(get_permalink($renewal_page_id));
-                        exit;
+                    // Not logged: this runs on every page view.
+                    // Filter 'creem_skip_renewal_redirect' lets other code keep pages reachable.
+                    if (!$has_any_role && !apply_filters('creem_skip_renewal_redirect', false, $current_user)) {
+                        // Skip if the renewal page no longer exists
+                        $renewal_url = get_permalink($renewal_page_id);
+                        if ($renewal_url && get_post_status($renewal_page_id) === 'publish') {
+                            wp_safe_redirect($renewal_url);
+                            exit;
+                        }
                     }
                 }
             }
@@ -3209,29 +3439,7 @@ class Creem_API_WordPress {
                 : '';
         }
 
-        $current_user = wp_get_current_user();
-
-        // Retrieve stored customer ID.
-        $customer_id = get_user_meta($current_user->ID, 'creem_customer_id', true);
-
-        // If not cached, try to extract it from the raw sale data.
-        if (empty($customer_id)) {
-            $sale_data_json = get_user_meta($current_user->ID, 'creem_sale_data', true);
-            if (!empty($sale_data_json)) {
-                $sale_data = json_decode($sale_data_json, true);
-                if (is_array($sale_data) && isset($sale_data['customer'])) {
-                    if (is_string($sale_data['customer']) && !empty($sale_data['customer'])) {
-                        $customer_id = $sale_data['customer'];
-                    } elseif (is_array($sale_data['customer']) && !empty($sale_data['customer']['id'])) {
-                        $customer_id = $sale_data['customer']['id'];
-                    }
-                }
-                // Cache for future shortcode renders.
-                if (!empty($customer_id)) {
-                    update_user_meta($current_user->ID, 'creem_customer_id', $customer_id);
-                }
-            }
-        }
+        $customer_id = $this->resolve_customer_id(get_current_user_id());
 
         if (empty($customer_id)) {
             return !empty($atts['no_subscription_text'])
@@ -3239,17 +3447,110 @@ class Creem_API_WordPress {
                 : '';
         }
 
-        $portal_link = $this->generate_customer_portal_link($customer_id);
+        // The portal link is generated on click (see ajax_billing_link), so page loads
+        // don't call the Creem API.
+        $classes = trim('creem-billing-link ' . $atts['class']);
 
-        if (is_wp_error($portal_link)) {
-            return '';
+        return '<a href="#" class="' . esc_attr($classes) . '"'
+            . ' data-nonce="' . esc_attr(wp_create_nonce('creem_billing_link')) . '"'
+            . ' data-ajax="' . esc_url(admin_url('admin-ajax.php')) . '">'
+            . esc_html($atts['text'])
+            . '</a>'
+            . $this->billing_link_script();
+    }
+
+    /**
+     * Creem customer ID for a user, from user meta or the stored sale data
+     */
+    private function resolve_customer_id($user_id) {
+        $customer_id = get_user_meta($user_id, 'creem_customer_id', true);
+        if (!empty($customer_id)) {
+            return $customer_id;
         }
 
-        $class_attr = !empty($atts['class']) ? ' class="' . esc_attr($atts['class']) . '"' : '';
+        $sale_data = json_decode((string) get_user_meta($user_id, 'creem_sale_data', true), true);
+        if (is_array($sale_data) && isset($sale_data['customer'])) {
+            if (is_string($sale_data['customer'])) {
+                $customer_id = $sale_data['customer'];
+            } elseif (!empty($sale_data['customer']['id'])) {
+                $customer_id = $sale_data['customer']['id'];
+            }
+        }
 
-        return '<a href="' . esc_url($portal_link) . '"' . $class_attr . ' target="_blank" rel="noopener noreferrer">'
-            . esc_html($atts['text'])
-            . '</a>';
+        if (!empty($customer_id)) {
+            update_user_meta($user_id, 'creem_customer_id', $customer_id);
+        }
+        return $customer_id;
+    }
+
+    /**
+     * AJAX: generate the billing portal link for the logged-in user.
+     * The customer ID comes from the user's own meta, never from the request.
+     */
+    public function ajax_billing_link() {
+        check_ajax_referer('creem_billing_link', 'nonce');
+
+        $customer_id = $this->resolve_customer_id(get_current_user_id());
+        if (empty($customer_id)) {
+            wp_send_json_error(array('message' => __('No billing account found.', 'snn')));
+        }
+
+        $portal_link = $this->generate_customer_portal_link($customer_id);
+        if (is_wp_error($portal_link)) {
+            $this->log_activity('Billing link error', array(
+                'user_id' => get_current_user_id(),
+                'error' => $portal_link->get_error_message()
+            ));
+            wp_send_json_error(array('message' => __('Billing is temporarily unavailable. Please try again later.', 'snn')));
+        }
+
+        wp_send_json_success(array('url' => esc_url_raw($portal_link)));
+    }
+
+    /**
+     * Click handler for [creem_billing_link], printed once per page
+     */
+    private function billing_link_script() {
+        static $printed = false;
+        if ($printed) {
+            return '';
+        }
+        $printed = true;
+
+        return "<script>
+(function () {
+    document.addEventListener('click', function (e) {
+        var link = e.target.closest ? e.target.closest('a.creem-billing-link') : null;
+        if (!link) { return; }
+        e.preventDefault();
+        if (link.getAttribute('aria-busy') === 'true') { return; }
+        link.setAttribute('aria-busy', 'true');
+
+        // Open the tab during the click so popup blockers allow it
+        var tab = window.open('', '_blank');
+        var body = new FormData();
+        body.append('action', 'creem_billing_link');
+        body.append('nonce', link.getAttribute('data-nonce'));
+
+        fetch(link.getAttribute('data-ajax'), { method: 'POST', body: body, credentials: 'same-origin' })
+            .then(function (r) { return r.json(); })
+            .then(function (res) {
+                var url = res && res.success && res.data && res.data.url;
+                if (url && /^https?:\\/\\//i.test(url)) {
+                    if (tab) { tab.opener = null; tab.location.href = url; } else { window.location.href = url; }
+                } else {
+                    if (tab) { tab.close(); }
+                    alert((res && res.data && res.data.message) || 'Billing is temporarily unavailable.');
+                }
+            })
+            .catch(function () {
+                if (tab) { tab.close(); }
+                alert('Billing is temporarily unavailable.');
+            })
+            .then(function () { link.removeAttribute('aria-busy'); });
+    });
+})();
+</script>";
     }
 }
 
