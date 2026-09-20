@@ -349,8 +349,24 @@ class Creem_API_WordPress {
     /**
      * Subscription statuses that end access once the paid period is over.
      * Creem uses the American spelling "canceled".
+     *
+     * "expired" means a billing period ended without payment, so it revokes like
+     * the rest. It is absent from the API reference's status enum but appears in
+     * the subscription.expired webhook payload and Creem's store monitoring docs.
      */
-    private static $ENDED_STATUSES = array('canceled', 'unpaid', 'past_due');
+    private static $ENDED_STATUSES = array('canceled', 'unpaid', 'past_due', 'expired');
+
+    /**
+     * Every subscription status Creem's docs mention anywhere. The API reference,
+     * the subscriptions feature page and the webhook payloads each list a different
+     * subset, so this is their union. Statuses outside it are logged once per cron
+     * run (see check_recent_sales) rather than silently ignored: an unknown status
+     * currently keeps access, so it must be visible.
+     */
+    private static $KNOWN_STATUSES = array(
+        'active', 'trialing', 'past_due', 'paused',
+        'canceled', 'expired', 'scheduled_cancel', 'unpaid', 'incomplete'
+    );
 
     /**
      * Per-request cache of API lookups (subscriptions, customers, orders, products).
@@ -725,8 +741,7 @@ class Creem_API_WordPress {
                 'url' => $orders_url,
                 'http_code' => $http_code,
                 'page' => $page_number,
-                'items_on_page' => isset($data['items']) ? count($data['items']) : 0,
-                'raw_response' => $data
+                'items_on_page' => isset($data['items']) ? count($data['items']) : 0
             ));
 
             if ($http_code === 401) {
@@ -756,15 +771,14 @@ class Creem_API_WordPress {
         } while ($has_next_page && count($transactions) < $sales_limit && $page_number <= 20);
 
         if (!empty($transactions)) {
-            $this->log_activity('RAW TRANSACTION FROM API', array(
-                'raw_transaction' => $transactions[0],
-                'total_fetched' => count($transactions)
-            ));
-
             $new_sales_count = 0;
             $refunds_processed = 0;
             $subscriptions_updated = 0;
             $skipped = 0;
+            // Statuses Creem returned that this plugin has no rule for. Collected and
+            // logged once below, never inside the loop: log_activity() rewrites the whole
+            // log option on every call, so per-item logging is very expensive.
+            $unknown_sub_statuses = array();
 
             // Sales skipped because auto-create was off for their product (sale_id => product_id)
             $skipped_sales = get_option('creem_skipped_sale_ids', array());
@@ -842,6 +856,9 @@ class Creem_API_WordPress {
                 if (!empty($settings['handle_subscriptions']) && $subscription) {
                     $sub_status = isset($subscription['status']) ? $subscription['status'] : '';
                     $period_end = isset($subscription['current_period_end_date']) ? $subscription['current_period_end_date'] : '';
+                    if ($sub_status !== '' && !in_array($sub_status, self::$KNOWN_STATUSES, true)) {
+                        $unknown_sub_statuses[$sub_status] = true;
+                    }
                     if (in_array($sub_status, self::$ENDED_STATUSES, true) && $this->date_has_passed($period_end)) {
                         $sub_result = $this->handle_subscription_change($sale, $subscription);
                         if (!is_wp_error($sub_result) && $sub_result) {
@@ -890,6 +907,13 @@ class Creem_API_WordPress {
                 'subscriptions_updated' => $subscriptions_updated,
                 'skipped_unresolved' => $skipped
             ));
+
+            if (!empty($unknown_sub_statuses)) {
+                $this->log_activity('Unrecognized subscription statuses', array(
+                    'statuses' => array_keys($unknown_sub_statuses),
+                    'note' => 'Access was left untouched. Add to $ENDED_STATUSES if the status should end access.'
+                ));
+            }
         }
 
         // Also check existing users' subscriptions for status changes
@@ -955,6 +979,7 @@ class Creem_API_WordPress {
         update_option('creem_existing_subs_offset', count($user_ids) < $batch_size ? 0 : $offset + $batch_size, false);
 
         $checked_count = 0;
+        $unknown_sub_statuses = array();
 
         foreach ($user_ids as $user_id) {
             $sale_data = json_decode((string) get_user_meta($user_id, 'creem_sale_data', true), true);
@@ -977,6 +1002,10 @@ class Creem_API_WordPress {
             $sub_status = isset($subscription['status']) ? $subscription['status'] : '';
             $period_end = isset($subscription['current_period_end_date']) ? $subscription['current_period_end_date'] : '';
 
+            if ($sub_status !== '' && !in_array($sub_status, self::$KNOWN_STATUSES, true)) {
+                $unknown_sub_statuses[$sub_status] = true;
+            }
+
             if (in_array($sub_status, self::$ENDED_STATUSES, true) && $this->date_has_passed($period_end)) {
                 // Make sure the stored sale has the customer email for handle_subscription_change
                 if (!isset($sale_data['customer']['email'])) {
@@ -997,6 +1026,14 @@ class Creem_API_WordPress {
                     ));
                 }
             }
+        }
+
+        if (!empty($unknown_sub_statuses)) {
+            $this->log_activity('Unrecognized subscription statuses', array(
+                'source' => 'existing subscription check',
+                'statuses' => array_keys($unknown_sub_statuses),
+                'note' => 'Access was left untouched. Add to $ENDED_STATUSES if the status should end access.'
+            ));
         }
 
         return $checked_count;
